@@ -1,0 +1,628 @@
+import type {
+	IDataObject,
+	IDisplayOptions,
+	IExecuteFunctions,
+	ILoadOptionsFunctions,
+	INodeExecutionData,
+	INodeProperties,
+	INodePropertyOptions,
+	INodeType,
+	INodeTypeDescription,
+} from 'n8n-workflow';
+import { NodeOperationError } from 'n8n-workflow';
+
+import {
+	clean,
+	conduytApiRequest,
+	conduytApiRequestAllItems,
+	splitTags,
+} from './GenericFunctions';
+
+const RESOURCES = [
+	{ name: 'Company', value: 'company' },
+	{ name: 'Contact', value: 'contact' },
+	{ name: 'Deal', value: 'deal' },
+	{ name: 'Message', value: 'message' },
+	{ name: 'Note', value: 'note' },
+	{ name: 'Tag', value: 'tag' },
+	{ name: 'Task', value: 'task' },
+];
+
+const RESOURCE_PATH: Record<string, string> = {
+	company: '/companies',
+	contact: '/contacts',
+	deal: '/deals',
+	message: '/messages',
+	note: '/notes',
+	tag: '/tags',
+	task: '/tasks',
+};
+
+function show(resource: string, operation?: string | string[]): IDisplayOptions {
+	const displayOptions: Record<string, string[]> = { resource: [resource] };
+	if (operation) displayOptions.operation = Array.isArray(operation) ? operation : [operation];
+	return { show: displayOptions };
+}
+
+const getAllFields = (resource: string): INodeProperties[] => [
+	{
+		displayName: 'Return All',
+		name: 'returnAll',
+		type: 'boolean' as const,
+		default: false,
+		description: 'Whether to return all results or only up to a given limit',
+		displayOptions: show(resource, 'getAll'),
+	},
+	{
+		displayName: 'Limit',
+		name: 'limit',
+		type: 'number' as const,
+		typeOptions: { minValue: 1 },
+		default: 50,
+		description: 'Max number of results to return',
+		displayOptions: { show: { resource: [resource], operation: ['getAll'], returnAll: [false] } },
+	},
+];
+
+const idField = (resource: string, label: string, ops: string[]): INodeProperties => ({
+	displayName: `${label} ID`,
+	name: 'id',
+	type: 'string' as const,
+	default: '',
+	required: true,
+	displayOptions: show(resource, ops),
+});
+
+export class Conduyt implements INodeType {
+	description: INodeTypeDescription = {
+		displayName: 'Conduyt',
+		name: 'conduyt',
+		icon: 'file:conduyt.svg',
+		group: ['transform'],
+		version: 1,
+		subtitle: '={{$parameter["operation"] + ": " + $parameter["resource"]}}',
+		description: 'Create and manage contacts, companies, deals, tasks, notes and messages in Conduyt CRM',
+		defaults: { name: 'Conduyt' },
+		inputs: ['main'],
+		outputs: ['main'],
+		credentials: [{ name: 'conduytApi', required: true }],
+		properties: [
+			{
+				displayName: 'Resource',
+				name: 'resource',
+				type: 'options',
+				noDataExpression: true,
+				options: RESOURCES,
+				default: 'contact',
+			},
+
+			// ---------- Contact ----------
+			{
+				displayName: 'Operation',
+				name: 'operation',
+				type: 'options',
+				noDataExpression: true,
+				displayOptions: show('contact'),
+				options: [
+					{ name: 'Add Tags', value: 'addTags', description: 'Add tags to a contact', action: 'Add tags to a contact' },
+					{ name: 'Create', value: 'create', description: 'Create a contact', action: 'Create a contact' },
+					{ name: 'Get', value: 'get', description: 'Get a contact', action: 'Get a contact' },
+					{ name: 'Get Many', value: 'getAll', description: 'Get many contacts', action: 'Get many contacts' },
+					{ name: 'Search', value: 'search', description: 'Find contacts by email or free text', action: 'Search contacts' },
+					{ name: 'Update', value: 'update', description: 'Update a contact', action: 'Update a contact' },
+				],
+				default: 'create',
+			},
+			idField('contact', 'Contact', ['get', 'update', 'addTags']),
+			{
+				displayName: 'First Name',
+				name: 'firstName',
+				type: 'string',
+				default: '',
+				required: true,
+				displayOptions: show('contact', 'create'),
+			},
+			{
+				displayName: 'Search By',
+				name: 'searchBy',
+				type: 'options',
+				options: [
+					{ name: 'Email', value: 'email' },
+					{ name: 'Text', value: 'search' },
+				],
+				default: 'email',
+				displayOptions: show('contact', 'search'),
+			},
+			{
+				displayName: 'Search Value',
+				name: 'searchValue',
+				type: 'string',
+				default: '',
+				required: true,
+				displayOptions: show('contact', 'search'),
+			},
+			{
+				displayName: 'Tag Names or IDs',
+				name: 'tagIds',
+				type: 'multiOptions',
+				typeOptions: { loadOptionsMethod: 'getTags' },
+				default: [],
+				required: true,
+				description:
+					'Choose from the list, or specify IDs using an <a href="https://docs.n8n.io/code/expressions/">expression</a>',
+				displayOptions: show('contact', 'addTags'),
+			},
+			{
+				displayName: 'Additional Fields',
+				name: 'additionalFields',
+				type: 'collection',
+				placeholder: 'Add Field',
+				default: {},
+				displayOptions: show('contact', ['create', 'update']),
+				options: [
+					{ displayName: 'Company', name: 'company', type: 'string', default: '' },
+					{
+						displayName: 'Custom Fields (JSON)',
+						name: 'customFields',
+						type: 'json',
+						default: '{}',
+						description: 'Object of custom field key to value',
+					},
+					{ displayName: 'Email', name: 'email', type: 'string', placeholder: 'name@email.com', default: '' },
+					{ displayName: 'First Name', name: 'firstName', type: 'string', default: '' },
+					{ displayName: 'Last Name', name: 'lastName', type: 'string', default: '' },
+					{
+						displayName: 'Phone',
+						name: 'phone',
+						type: 'string',
+						default: '',
+						description: 'E.164 format, e.g. +12065551234',
+					},
+					{ displayName: 'Source', name: 'source', type: 'string', default: '' },
+					{
+						displayName: 'Tags',
+						name: 'tags',
+						type: 'string',
+						default: '',
+						description: 'Comma-separated tag names',
+					},
+				],
+			},
+
+			// ---------- Company ----------
+			{
+				displayName: 'Operation',
+				name: 'operation',
+				type: 'options',
+				noDataExpression: true,
+				displayOptions: show('company'),
+				options: [
+					{ name: 'Create', value: 'create', description: 'Create a company', action: 'Create a company' },
+					{ name: 'Get', value: 'get', description: 'Get a company', action: 'Get a company' },
+					{ name: 'Get Many', value: 'getAll', description: 'Get many companies', action: 'Get many companies' },
+					{ name: 'Update', value: 'update', description: 'Update a company', action: 'Update a company' },
+				],
+				default: 'create',
+			},
+			idField('company', 'Company', ['get', 'update']),
+			{
+				displayName: 'Name',
+				name: 'name',
+				type: 'string',
+				default: '',
+				required: true,
+				displayOptions: show('company', 'create'),
+			},
+			{
+				displayName: 'Additional Fields',
+				name: 'additionalFields',
+				type: 'collection',
+				placeholder: 'Add Field',
+				default: {},
+				displayOptions: show('company', ['create', 'update']),
+				options: [
+					{ displayName: 'Address', name: 'address', type: 'string', default: '' },
+					{ displayName: 'Domain', name: 'domain', type: 'string', default: '' },
+					{ displayName: 'Industry', name: 'industry', type: 'string', default: '' },
+					{ displayName: 'Name', name: 'name', type: 'string', default: '' },
+					{ displayName: 'Phone', name: 'phone', type: 'string', default: '' },
+					{ displayName: 'Size', name: 'size', type: 'string', default: '' },
+				],
+			},
+
+			// ---------- Deal ----------
+			{
+				displayName: 'Operation',
+				name: 'operation',
+				type: 'options',
+				noDataExpression: true,
+				displayOptions: show('deal'),
+				options: [
+					{ name: 'Create', value: 'create', description: 'Create a deal', action: 'Create a deal' },
+					{ name: 'Get', value: 'get', description: 'Get a deal', action: 'Get a deal' },
+					{ name: 'Get Many', value: 'getAll', description: 'Get many deals', action: 'Get many deals' },
+					{ name: 'Update', value: 'update', description: 'Update a deal', action: 'Update a deal' },
+				],
+				default: 'create',
+			},
+			idField('deal', 'Deal', ['get', 'update']),
+			{
+				displayName: 'Title',
+				name: 'title',
+				type: 'string',
+				default: '',
+				required: true,
+				displayOptions: show('deal', 'create'),
+			},
+			{
+				displayName: 'Pipeline Name or ID',
+				name: 'pipelineId',
+				type: 'options',
+				typeOptions: { loadOptionsMethod: 'getPipelines' },
+				default: '',
+				description:
+					'Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>',
+				displayOptions: show('deal', 'create'),
+			},
+			{
+				displayName: 'Stage Name or ID',
+				name: 'stageId',
+				type: 'options',
+				typeOptions: { loadOptionsMethod: 'getStages', loadOptionsDependsOn: ['pipelineId'] },
+				default: '',
+				description:
+					'Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>',
+				displayOptions: show('deal', 'create'),
+			},
+			{
+				displayName: 'Additional Fields',
+				name: 'additionalFields',
+				type: 'collection',
+				placeholder: 'Add Field',
+				default: {},
+				displayOptions: show('deal', ['create', 'update']),
+				options: [
+					{ displayName: 'Assigned To (User ID)', name: 'assignedTo', type: 'string', default: '' },
+					{ displayName: 'Company ID', name: 'companyId', type: 'string', default: '' },
+					{ displayName: 'Contact ID', name: 'contactId', type: 'string', default: '' },
+					{ displayName: 'Expected Close Date', name: 'expectedCloseDate', type: 'dateTime', default: '' },
+					{ displayName: 'Pipeline ID', name: 'pipelineId', type: 'string', default: '' },
+					{ displayName: 'Stage ID', name: 'stageId', type: 'string', default: '' },
+					{
+						displayName: 'Status',
+						name: 'status',
+						type: 'options',
+						options: [
+							{ name: 'Open', value: 'open' },
+							{ name: 'Won', value: 'won' },
+							{ name: 'Lost', value: 'lost' },
+						],
+						default: 'open',
+					},
+					{ displayName: 'Title', name: 'title', type: 'string', default: '' },
+					{ displayName: 'Value', name: 'value', type: 'number', default: 0 },
+				],
+			},
+
+			// ---------- Task ----------
+			{
+				displayName: 'Operation',
+				name: 'operation',
+				type: 'options',
+				noDataExpression: true,
+				displayOptions: show('task'),
+				options: [
+					{ name: 'Create', value: 'create', description: 'Create a task', action: 'Create a task' },
+					{ name: 'Get', value: 'get', description: 'Get a task', action: 'Get a task' },
+					{ name: 'Get Many', value: 'getAll', description: 'Get many tasks', action: 'Get many tasks' },
+					{ name: 'Update', value: 'update', description: 'Update a task', action: 'Update a task' },
+				],
+				default: 'create',
+			},
+			idField('task', 'Task', ['get', 'update']),
+			{
+				displayName: 'Title',
+				name: 'title',
+				type: 'string',
+				default: '',
+				required: true,
+				displayOptions: show('task', 'create'),
+			},
+			{
+				displayName: 'Additional Fields',
+				name: 'additionalFields',
+				type: 'collection',
+				placeholder: 'Add Field',
+				default: {},
+				displayOptions: show('task', ['create', 'update']),
+				options: [
+					{ displayName: 'Assigned To (User ID)', name: 'assignedTo', type: 'string', default: '' },
+					{ displayName: 'Contact ID', name: 'contactId', type: 'string', default: '' },
+					{ displayName: 'Deal ID', name: 'dealId', type: 'string', default: '' },
+					{ displayName: 'Description', name: 'description', type: 'string', default: '' },
+					{ displayName: 'Due Date', name: 'dueDate', type: 'dateTime', default: '' },
+					{
+						displayName: 'Priority',
+						name: 'priority',
+						type: 'options',
+						options: [
+							{ name: 'Low', value: 'low' },
+							{ name: 'Medium', value: 'medium' },
+							{ name: 'High', value: 'high' },
+						],
+						default: 'medium',
+					},
+					{
+						displayName: 'Status',
+						name: 'status',
+						type: 'options',
+						options: [
+							{ name: 'To Do', value: 'todo' },
+							{ name: 'Done', value: 'done' },
+						],
+						default: 'todo',
+					},
+					{ displayName: 'Title', name: 'title', type: 'string', default: '' },
+				],
+			},
+
+			// ---------- Note ----------
+			{
+				displayName: 'Operation',
+				name: 'operation',
+				type: 'options',
+				noDataExpression: true,
+				displayOptions: show('note'),
+				options: [
+					{ name: 'Create', value: 'create', description: 'Add a note to a contact or deal', action: 'Create a note' },
+					{ name: 'Get Many', value: 'getAll', description: 'Get many notes', action: 'Get many notes' },
+				],
+				default: 'create',
+			},
+			{
+				displayName: 'Content',
+				name: 'body',
+				type: 'string',
+				typeOptions: { rows: 4 },
+				default: '',
+				required: true,
+				displayOptions: show('note', 'create'),
+			},
+			{
+				displayName: 'Contact ID',
+				name: 'contactId',
+				type: 'string',
+				default: '',
+				description: 'Attach the note to this contact (this or Deal ID is required)',
+				displayOptions: show('note', 'create'),
+			},
+			{
+				displayName: 'Deal ID',
+				name: 'dealId',
+				type: 'string',
+				default: '',
+				displayOptions: show('note', 'create'),
+			},
+
+			// ---------- Message ----------
+			{
+				displayName: 'Operation',
+				name: 'operation',
+				type: 'options',
+				noDataExpression: true,
+				displayOptions: show('message'),
+				options: [
+					{ name: 'Send', value: 'send', description: 'Send an SMS or email to a contact', action: 'Send a message' },
+					{ name: 'Get Many', value: 'getAll', description: 'Get many messages', action: 'Get many messages' },
+				],
+				default: 'send',
+			},
+			{
+				displayName: 'Contact ID',
+				name: 'contactId',
+				type: 'string',
+				default: '',
+				required: true,
+				displayOptions: show('message', 'send'),
+			},
+			{
+				displayName: 'Channel',
+				name: 'channel',
+				type: 'options',
+				options: [
+					{ name: 'SMS', value: 'sms' },
+					{ name: 'Email', value: 'email' },
+				],
+				default: 'sms',
+				displayOptions: show('message', 'send'),
+			},
+			{
+				displayName: 'Subject',
+				name: 'subject',
+				type: 'string',
+				default: '',
+				displayOptions: { show: { resource: ['message'], operation: ['send'], channel: ['email'] } },
+			},
+			{
+				displayName: 'Body',
+				name: 'body',
+				type: 'string',
+				typeOptions: { rows: 4 },
+				default: '',
+				required: true,
+				displayOptions: show('message', 'send'),
+			},
+
+			// ---------- Tag ----------
+			{
+				displayName: 'Operation',
+				name: 'operation',
+				type: 'options',
+				noDataExpression: true,
+				displayOptions: show('tag'),
+				options: [
+					{ name: 'Create', value: 'create', description: 'Create a tag', action: 'Create a tag' },
+					{ name: 'Get Many', value: 'getAll', description: 'Get many tags', action: 'Get many tags' },
+				],
+				default: 'getAll',
+			},
+			{
+				displayName: 'Name',
+				name: 'name',
+				type: 'string',
+				default: '',
+				required: true,
+				displayOptions: show('tag', 'create'),
+			},
+
+			// ---------- shared ----------
+			...getAllFields('contact'),
+			...getAllFields('company'),
+			...getAllFields('deal'),
+			...getAllFields('task'),
+			...getAllFields('note'),
+			...getAllFields('message'),
+			...getAllFields('tag'),
+		],
+	};
+
+	methods = {
+		loadOptions: {
+			async getPipelines(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				const pipelines = (await conduytApiRequest.call(this, 'GET', '/pipelines')) as IDataObject[];
+				return (pipelines || []).map((p) => ({ name: String(p.name), value: String(p.id) }));
+			},
+			async getStages(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				const pipelineId = this.getCurrentNodeParameter('pipelineId') as string;
+				if (!pipelineId) return [];
+				const stages = (await conduytApiRequest.call(
+					this,
+					'GET',
+					`/pipelines/${pipelineId}/stages`,
+				)) as IDataObject[];
+				return (stages || []).map((s) => ({ name: String(s.name), value: String(s.id) }));
+			},
+			async getTags(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				const tags = await conduytApiRequestAllItems.call(this, '/tags');
+				return tags.map((t) => ({ name: String(t.name), value: String(t.id) }));
+			},
+		},
+	};
+
+	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
+		const items = this.getInputData();
+		const returnData: INodeExecutionData[] = [];
+		const resource = this.getNodeParameter('resource', 0) as string;
+		const operation = this.getNodeParameter('operation', 0) as string;
+		const basePath = RESOURCE_PATH[resource];
+
+		for (let i = 0; i < items.length; i++) {
+			try {
+				let result: unknown;
+
+				if (operation === 'getAll') {
+					const returnAll = this.getNodeParameter('returnAll', i) as boolean;
+					const limit = returnAll ? 0 : (this.getNodeParameter('limit', i) as number);
+					result = await conduytApiRequestAllItems.call(this, basePath, {}, limit);
+				} else if (operation === 'get') {
+					const id = this.getNodeParameter('id', i) as string;
+					result = await conduytApiRequest.call(this, 'GET', `${basePath}/${id}`);
+				} else if (resource === 'contact' && operation === 'search') {
+					const by = this.getNodeParameter('searchBy', i) as string;
+					const value = (this.getNodeParameter('searchValue', i) as string).trim();
+					const found = (await conduytApiRequest.call(this, 'GET', basePath, {}, {
+						search: value,
+						per_page: 25,
+					})) as IDataObject[];
+					result =
+						by === 'email'
+							? (found || []).filter(
+									(c) => String(c.email ?? '').toLowerCase() === value.toLowerCase(),
+								)
+							: found;
+				} else if (resource === 'contact' && operation === 'addTags') {
+					const id = this.getNodeParameter('id', i) as string;
+					const tagIds = this.getNodeParameter('tagIds', i) as string[];
+					result = await conduytApiRequest.call(this, 'POST', `${basePath}/${id}/tags`, { tagIds });
+				} else if (resource === 'note' && operation === 'create') {
+					const body = clean({
+						body: this.getNodeParameter('body', i) as string,
+						contactId: this.getNodeParameter('contactId', i) as string,
+						dealId: this.getNodeParameter('dealId', i) as string,
+					});
+					if (!body.contactId && !body.dealId) {
+						throw new NodeOperationError(this.getNode(), 'A note needs a Contact ID or a Deal ID', {
+							itemIndex: i,
+						});
+					}
+					result = await conduytApiRequest.call(this, 'POST', basePath, body);
+				} else if (resource === 'message' && operation === 'send') {
+					const channel = this.getNodeParameter('channel', i) as string;
+					const body = clean({
+						contactId: this.getNodeParameter('contactId', i) as string,
+						channel,
+						direction: 'outbound',
+						subject: channel === 'email' ? (this.getNodeParameter('subject', i) as string) : undefined,
+						body: this.getNodeParameter('body', i) as string,
+					});
+					result = await conduytApiRequest.call(this, 'POST', basePath, body);
+				} else if (resource === 'tag' && operation === 'create') {
+					result = await conduytApiRequest.call(this, 'POST', basePath, {
+						name: this.getNodeParameter('name', i) as string,
+					});
+				} else if (operation === 'create' || operation === 'update') {
+					const additional = this.getNodeParameter('additionalFields', i, {}) as IDataObject;
+					const body: IDataObject = { ...additional };
+
+					if (operation === 'create') {
+						if (resource === 'contact') body.firstName = this.getNodeParameter('firstName', i);
+						if (resource === 'company') body.name = this.getNodeParameter('name', i);
+						if (resource === 'task') body.title = this.getNodeParameter('title', i);
+						if (resource === 'deal') {
+							body.title = this.getNodeParameter('title', i);
+							body.pipelineId = this.getNodeParameter('pipelineId', i, '');
+							body.stageId = this.getNodeParameter('stageId', i, '');
+						}
+					}
+					if (typeof body.tags === 'string') body.tags = splitTags(body.tags);
+					if (typeof body.customFields === 'string') {
+						try {
+							body.customFields = JSON.parse(body.customFields as string);
+						} catch {
+							throw new NodeOperationError(this.getNode(), 'Custom Fields must be valid JSON', {
+								itemIndex: i,
+							});
+						}
+					}
+
+					const cleaned = clean(body);
+					if (operation === 'create') {
+						result = await conduytApiRequest.call(this, 'POST', basePath, cleaned);
+					} else {
+						const id = this.getNodeParameter('id', i) as string;
+						result = await conduytApiRequest.call(this, 'PATCH', `${basePath}/${id}`, cleaned);
+					}
+				} else {
+					throw new NodeOperationError(
+						this.getNode(),
+						`The operation "${operation}" is not supported for ${resource}`,
+						{ itemIndex: i },
+					);
+				}
+
+				const out = this.helpers.returnJsonArray(
+					(Array.isArray(result) ? result : [result]) as IDataObject[],
+				);
+				returnData.push(...this.helpers.constructExecutionMetaData(out, { itemData: { item: i } }));
+			} catch (error) {
+				if (this.continueOnFail()) {
+					returnData.push({ json: { error: (error as Error).message }, pairedItem: { item: i } });
+					continue;
+				}
+				throw error;
+			}
+		}
+
+		return [returnData];
+	}
+}

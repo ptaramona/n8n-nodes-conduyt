@@ -1,0 +1,61 @@
+{
+  "name": "n8n-nodes-conduyt",
+  "version": "0.1.0",
+  "description": "n8n community node for Conduyt CRM: contacts, companies, deals, tasks, notes, messages, tags, and a webhook trigger for CRM events.",
+  "keywords": [
+    "n8n-community-node-package",
+    "conduyt",
+    "crm",
+    "sales",
+    "sms",
+    "pipeline"
+  ],
+  "license": "MIT",
+  "homepage": "https://conduyt.com",
+  "author": {
+    "name": "Conduyt",
+    "email": "support@conduyt.app"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/conduyt/n8n-nodes-conduyt.git"
+  },
+  "engines": {
+    "node": ">=18.10"
+  },
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc && gulp build:icons",
+    "dev": "tsc --watch",
+    "format": "prettier nodes credentials --write",
+    "lint": "eslint nodes credentials package.json",
+    "lintfix": "eslint nodes credentials package.json --fix",
+    "prepublishOnly": "npm run build && npm run lint -c .eslintrc.prepublish.js nodes credentials package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "credentials": [
+      "dist/credentials/ConduytApi.credentials.js"
+    ],
+    "nodes": [
+      "dist/nodes/Conduyt/Conduyt.node.js",
+      "dist/nodes/ConduytTrigger/ConduytTrigger.node.js"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.130",
+    "@typescript-eslint/parser": "^7.15.0",
+    "eslint": "^8.56.0",
+    "eslint-plugin-n8n-nodes-base": "^1.16.1",
+    "gulp": "^4.0.2",
+    "n8n-workflow": "^1.48.0",
+    "prettier": "^3.3.2",
+    "typescript": "^5.5.3"
+  },
+  "peerDependencies": {
+    "n8n-workflow": "*"
+  }
+}
