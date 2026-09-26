@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-conduyt",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "n8n community node for Conduyt CRM: contacts, companies, deals, tasks, notes, messages, tags, and a webhook trigger for CRM events.",
   "keywords": [
     "n8n-community-node-package",
@@ -29,8 +29,7 @@
     "dev": "tsc --watch",
     "format": "prettier nodes credentials --write",
     "lint": "eslint nodes credentials package.json",
-    "lintfix": "eslint nodes credentials package.json --fix",
-    "prepublishOnly": "npm run build && npm run lint -c .eslintrc.prepublish.js nodes credentials package.json"
+    "lintfix": "eslint nodes credentials package.json --fix"
   },
   "files": [
     "dist"
@@ -57,5 +56,9 @@
   },
   "peerDependencies": {
     "n8n-workflow": "*"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   }
 }
