@@ -4,7 +4,7 @@ import type {
 	IHookFunctions,
 	IHttpRequestMethods,
 	ILoadOptionsFunctions,
-	IRequestOptions,
+	IHttpRequestOptions,
 	JsonObject,
 } from 'n8n-workflow';
 import { NodeApiError } from 'n8n-workflow';
@@ -44,22 +44,22 @@ export async function conduytApiRequest(
 		'',
 	);
 
-	const options: IRequestOptions = {
+	const options: IHttpRequestOptions = {
 		method,
-		uri: `${baseUrl}${endpoint}`,
+		url: `${baseUrl}${endpoint}`,
 		qs,
 		body,
 		json: true,
 		headers: {
 			Accept: 'application/json',
-			'User-Agent': 'n8n-nodes-conduyt/0.1.0',
+			'User-Agent': 'n8n-nodes-conduyt',
 		},
 	};
 	if (Object.keys(body).length === 0) delete options.body;
 	if (Object.keys(qs).length === 0) delete options.qs;
 
 	try {
-		const response = await this.helpers.requestWithAuthentication.call(
+		const response = await this.helpers.httpRequestWithAuthentication.call(
 			this,
 			'conduytApi',
 			options,

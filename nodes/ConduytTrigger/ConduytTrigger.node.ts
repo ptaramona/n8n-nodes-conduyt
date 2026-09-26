@@ -7,6 +7,7 @@ import type {
 	IWebhookFunctions,
 	IWebhookResponseData,
 } from 'n8n-workflow';
+import { NodeConnectionTypes } from 'n8n-workflow';
 
 import { conduytApiRequest, conduytApiRequestAllItems } from '../Conduyt/GenericFunctions';
 
@@ -50,14 +51,14 @@ export class ConduytTrigger implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'Conduyt Trigger',
 		name: 'conduytTrigger',
-		icon: 'file:../Conduyt/conduyt.svg',
+		icon: { light: 'file:../Conduyt/conduyt.svg', dark: 'file:../Conduyt/conduyt.dark.svg' },
 		group: ['trigger'],
 		version: 1,
 		subtitle: '={{$parameter["events"].join(", ")}}',
 		description: 'Starts the workflow when something happens in Conduyt CRM',
 		defaults: { name: 'Conduyt Trigger' },
 		inputs: [],
-		outputs: ['main'],
+		outputs: [NodeConnectionTypes.Main],
 		credentials: [{ name: 'conduytApi', required: true }],
 		webhooks: [
 			{
@@ -90,7 +91,10 @@ export class ConduytTrigger implements INodeType {
 					try {
 						await conduytApiRequest.call(this, 'GET', `/webhooks/manage/${staticData.webhookId}`);
 						return true;
-					} catch {
+					} catch (error) {
+						this.logger.debug(
+							`Conduyt Trigger: stored webhook not found, re-registering (${(error as Error).message})`,
+						);
 						delete staticData.webhookId;
 						delete staticData.webhookSecret;
 					}
@@ -129,7 +133,10 @@ export class ConduytTrigger implements INodeType {
 				if (staticData.webhookId) {
 					try {
 						await conduytApiRequest.call(this, 'DELETE', `/webhooks/manage/${staticData.webhookId}`);
-					} catch {
+					} catch (error) {
+						this.logger.warn(
+							`Conduyt Trigger: could not remove webhook ${String(staticData.webhookId)}: ${(error as Error).message}`,
+						);
 						return false;
 					}
 					delete staticData.webhookId;

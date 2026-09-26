@@ -2,6 +2,7 @@ import type {
 	IAuthenticateGeneric,
 	ICredentialTestRequest,
 	ICredentialType,
+	Icon,
 	INodeProperties,
 } from 'n8n-workflow';
 
@@ -9,6 +10,8 @@ export class ConduytApi implements ICredentialType {
 	name = 'conduytApi';
 
 	displayName = 'Conduyt API';
+
+	icon: Icon = { light: 'file:conduyt.svg', dark: 'file:conduyt.dark.svg' };
 
 	documentationUrl = 'https://conduyt.app/api-reference';
 

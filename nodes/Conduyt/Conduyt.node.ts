@@ -9,7 +9,7 @@ import type {
 	INodeType,
 	INodeTypeDescription,
 } from 'n8n-workflow';
-import { NodeOperationError } from 'n8n-workflow';
+import { NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
 
 import {
 	clean,
@@ -77,14 +77,15 @@ export class Conduyt implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'Conduyt',
 		name: 'conduyt',
-		icon: 'file:conduyt.svg',
+		icon: { light: 'file:conduyt.svg', dark: 'file:conduyt.dark.svg' },
 		group: ['transform'],
 		version: 1,
 		subtitle: '={{$parameter["operation"] + ": " + $parameter["resource"]}}',
 		description: 'Create and manage contacts, companies, deals, tasks, notes and messages in Conduyt CRM',
 		defaults: { name: 'Conduyt' },
-		inputs: ['main'],
-		outputs: ['main'],
+		usableAsTool: true,
+		inputs: [NodeConnectionTypes.Main],
+		outputs: [NodeConnectionTypes.Main],
 		credentials: [{ name: 'conduytApi', required: true }],
 		properties: [
 			{
@@ -619,7 +620,7 @@ export class Conduyt implements INodeType {
 					returnData.push({ json: { error: (error as Error).message }, pairedItem: { item: i } });
 					continue;
 				}
-				throw error;
+				throw new NodeOperationError(this.getNode(), error as Error, { itemIndex: i });
 			}
 		}
 
