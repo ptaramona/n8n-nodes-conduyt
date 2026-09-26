@@ -9,7 +9,7 @@ import type {
 	INodeType,
 	INodeTypeDescription,
 } from 'n8n-workflow';
-import { NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
+import { NodeApiError, NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
 
 import {
 	clean,
@@ -118,6 +118,14 @@ export class Conduyt implements INodeType {
 			{
 				displayName: 'First Name',
 				name: 'firstName',
+				type: 'string',
+				default: '',
+				required: true,
+				displayOptions: show('contact', 'create'),
+			},
+			{
+				displayName: 'Last Name',
+				name: 'lastName',
 				type: 'string',
 				default: '',
 				required: true,
@@ -576,7 +584,10 @@ export class Conduyt implements INodeType {
 					const body: IDataObject = { ...additional };
 
 					if (operation === 'create') {
-						if (resource === 'contact') body.firstName = this.getNodeParameter('firstName', i);
+						if (resource === 'contact') {
+							body.firstName = this.getNodeParameter('firstName', i);
+							body.lastName = this.getNodeParameter('lastName', i);
+						}
 						if (resource === 'company') body.name = this.getNodeParameter('name', i);
 						if (resource === 'task') body.title = this.getNodeParameter('title', i);
 						if (resource === 'deal') {
@@ -620,6 +631,7 @@ export class Conduyt implements INodeType {
 					returnData.push({ json: { error: (error as Error).message }, pairedItem: { item: i } });
 					continue;
 				}
+				if (error instanceof NodeApiError || error instanceof NodeOperationError) throw error;
 				throw new NodeOperationError(this.getNode(), error as Error, { itemIndex: i });
 			}
 		}
