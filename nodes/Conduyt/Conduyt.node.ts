@@ -430,7 +430,7 @@ export class Conduyt implements INodeType {
 			},
 			{
 				displayName:
-					'Each item is sent with its own idempotency key, so Retry On Fail and a manual Retry of a failed execution never send the same message twice. For SMS the key stays with the message. For email Conduyt keeps the key for 24 hours: a retry within 24 hours never sends twice, a retry after 24 hours sends the email again. Set Idempotency Key below to supply your own key instead: it survives a worker crash between Conduyt accepting the request and n8n saving the run, which the generated key cannot.',
+					'Each item is sent with its own idempotency key, so Retry On Fail and a manual Retry of a failed execution never send the same message twice. For SMS the key stays with the message. For email Conduyt keeps the key for 24 hours: a retry within 24 hours never sends twice, a retry after 24 hours sends the email again. Set Idempotency Key below to supply your own key from the upstream item instead: the key itself survives a worker crash between Conduyt accepting the request and n8n saving the run, but the saved request snapshot does not, so give the same key the same item data every time. Each key must belong to one item; reusing it for a different item or node is rejected.',
 				name: 'sendRetryNotice',
 				type: 'notice',
 				default: '',
@@ -487,7 +487,7 @@ export class Conduyt implements INodeType {
 				type: 'string',
 				default: '',
 				description:
-					'Map a unique ID from the upstream item, such as the record or event ID. When set, it is used as the key exactly as given (SMS: 8 to 200 characters; email: up to 255) and survives any crash or retry. Left empty, the node generates a key that holds for retries of the same execution, but a worker crash between Conduyt accepting the request and n8n saving the run can send it again.',
+					'Map a unique ID from the upstream item, such as the record or event ID, sent exactly as given (SMS: 8 to 200 characters; email: up to 255). The key stays stable across any retry, including one after a worker crash, but the saved snapshot of the request does not survive that crash, only the key does, so the same key must always come with the same item data. Reusing a key for a different item or node is rejected. Left empty, the node generates a key that holds, snapshot included, for retries of the same execution, but a worker crash between Conduyt accepting the request and n8n saving the run can send it again.',
 				displayOptions: show('message', 'send'),
 			},
 

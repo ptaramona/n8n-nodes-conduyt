@@ -5,9 +5,10 @@ import type {
 	IHttpRequestMethods,
 	ILoadOptionsFunctions,
 	IHttpRequestOptions,
+	INode,
 	JsonObject,
 } from 'n8n-workflow';
-import { NodeApiError } from 'n8n-workflow';
+import { NodeApiError, NodeOperationError } from 'n8n-workflow';
 import { createHash } from 'crypto';
 
 type ConduytContext = IExecuteFunctions | IHookFunctions | ILoadOptionsFunctions;
@@ -145,8 +146,11 @@ export function sendIdempotencyKey(this: IExecuteFunctions, itemIndex: number): 
 	return `n8n-${createHash('sha256').update(parts.join('\n')).digest('hex')}`;
 }
 
-/** Flow-context key under which evaluated send envelopes are kept, by idempotency key. */
+/** Flow-context key under which evaluated send envelopes are kept, by stable send slot. */
 const SEND_ENVELOPES_KEY = 'conduytSendEnvelopes';
+
+/** Flow-context key recording which stable send slot currently owns a caller-supplied key. */
+const SEND_KEY_OWNERS_KEY = 'conduytSendKeyOwners';
 
 /** Everything a Message > Send request is built from, frozen at first evaluation. */
 export interface SendEnvelope {
@@ -167,20 +171,59 @@ function isSendEnvelope(value: unknown): value is SendEnvelope {
 }
 
 /**
+ * Identifies one item's send independent of any execution id: this node, this loop run,
+ * this item, every time this exact send is attempted. Snapshots are cached by slot rather
+ * than by the wire key so that a caller-supplied key reused by a different item or node is
+ * a detectable collision instead of one send silently returning another's cached envelope.
+ */
+function sendSlot(this: IExecuteFunctions, itemIndex: number): string {
+	const parts = [
+		this.getNode().name,
+		String(this.getWorkflowDataProxy(itemIndex).$thisRunIndex),
+		String(itemIndex),
+	];
+	return createHash('sha256').update(parts.join('\n')).digest('hex');
+}
+
+/** Conduyt's own key-length bounds, checked here so a bad key fails before the request goes out. */
+function assertCallerKeyLength(node: INode, channel: string, key: string, itemIndex: number): void {
+	if (channel === 'sms') {
+		if (key.length < 8 || key.length > 200) {
+			throw new NodeOperationError(
+				node,
+				`Idempotency Key must be 8 to 200 characters for SMS, got ${key.length}`,
+				{ itemIndex },
+			);
+		}
+	} else if (key.length > 255) {
+		throw new NodeOperationError(
+			node,
+			`Idempotency Key must be at most 255 characters for email, got ${key.length}`,
+			{ itemIndex },
+		);
+	}
+}
+
+/**
  * The envelope that goes with an item's idempotency key. Both Conduyt endpoints bind a key
  * to the request content, and n8n re-evaluates expressions ($now, $execution.id, ...) on a
  * manual retry, so re-reading the parameters next to a reused key would turn a retry into
  * a conflict (same channel, different payload) or into a request on the other endpoint
- * (channel changed). The first evaluation is kept in the flow context, which rides the
- * saved run data into every retry of the family, and every later attempt reuses it.
+ * (channel changed). The first evaluation is kept in the flow context, under the item's
+ * stable send slot, which rides the saved run data into every retry of the family, and
+ * every later attempt against that same slot reuses it.
  *
- * `callerKey`, when non-empty, is used as the idempotency key exactly as given instead of
- * the generated one, and skips `sendIdempotencyKey` (and its `conduytRootExecutionId` flow
+ * `callerKey`, when non-empty (trimming is used only to test for emptiness; the key is
+ * cached and sent exactly as given), is used as the idempotency key instead of the
+ * generated one, and skips `sendIdempotencyKey` (and its `conduytRootExecutionId` flow
  * write) entirely: the key then comes straight from the item's own data on every attempt,
- * so it is already identical on a retry even if the flow context that would have carried
- * a generated key never reached the saved execution (a crash between Conduyt accepting the
- * request and n8n persisting the run). The envelope snapshot is still kept under that key
- * the same way, so a retry with the same caller key reuses it rather than re-evaluating.
+ * so it is already identical on a retry even if the flow context never reached a saved
+ * execution (a crash between Conduyt accepting the request and n8n persisting the run).
+ * Only the KEY is guaranteed stable through that: if the flow context carrying the
+ * snapshot is lost in the same crash, the payload is re-evaluated from scratch, so the
+ * same caller key must always come with the same item data (channel, contact, body) or a
+ * crash-triggered retry can send a different payload under the matching key. A caller key
+ * already owned by a different send slot is rejected rather than reused.
  */
 export function sendEnvelope(
 	this: IExecuteFunctions,
@@ -188,16 +231,39 @@ export function sendEnvelope(
 	callerKey: string,
 	evaluate: () => Omit<SendEnvelope, 'idempotencyKey'>,
 ): SendEnvelope {
-	const idempotencyKey = callerKey.trim() || sendIdempotencyKey.call(this, itemIndex);
+	const slot = sendSlot.call(this, itemIndex);
 	const flow = this.getContext('flow');
 	if (!flow[SEND_ENVELOPES_KEY] || typeof flow[SEND_ENVELOPES_KEY] !== 'object') {
 		flow[SEND_ENVELOPES_KEY] = {};
 	}
 	const envelopes = flow[SEND_ENVELOPES_KEY] as Record<string, unknown>;
-	const stored = envelopes[idempotencyKey];
-	if (isSendEnvelope(stored) && stored.idempotencyKey === idempotencyKey) return stored;
-	const envelope: SendEnvelope = { idempotencyKey, ...evaluate() };
-	envelopes[idempotencyKey] = envelope;
+	const stored = envelopes[slot];
+	if (isSendEnvelope(stored)) return stored;
+
+	const hasCallerKey = callerKey.trim() !== '';
+	const fields = evaluate();
+	const idempotencyKey = hasCallerKey ? callerKey : sendIdempotencyKey.call(this, itemIndex);
+
+	if (hasCallerKey) {
+		assertCallerKeyLength(this.getNode(), fields.channel, idempotencyKey, itemIndex);
+
+		if (!flow[SEND_KEY_OWNERS_KEY] || typeof flow[SEND_KEY_OWNERS_KEY] !== 'object') {
+			flow[SEND_KEY_OWNERS_KEY] = {};
+		}
+		const owners = flow[SEND_KEY_OWNERS_KEY] as Record<string, string>;
+		const owner = owners[callerKey];
+		if (owner !== undefined && owner !== slot) {
+			throw new NodeOperationError(
+				this.getNode(),
+				`Idempotency Key "${callerKey}" is already in use by another item or node; give each message its own key`,
+				{ itemIndex },
+			);
+		}
+		owners[callerKey] = slot;
+	}
+
+	const envelope: SendEnvelope = { idempotencyKey, ...fields };
+	envelopes[slot] = envelope;
 	return envelope;
 }
 

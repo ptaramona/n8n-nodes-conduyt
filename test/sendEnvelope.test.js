@@ -10,7 +10,7 @@ const { Conduyt } = require('../dist/nodes/Conduyt/Conduyt.node');
  * plays the expression evaluator: a manual retry re-evaluates $now, $execution.id and
  * the like, so the retry gets a different `params`.
  */
-function execution({ executionId, flow, items = 2, params, send }) {
+function execution({ executionId, flow, items = 2, params, send, nodeName = 'Send' }) {
 	const requests = [];
 	return {
 		requests,
@@ -32,7 +32,7 @@ function execution({ executionId, flow, items = 2, params, send }) {
 				data.map((entry) => ({ ...entry, pairedItem: itemData })),
 		},
 		continueOnFail: () => false,
-		getNode: () => ({ name: 'Send', type: 'n8n-nodes-conduyt.conduyt', typeVersion: 1, position: [0, 0], parameters: {} }),
+		getNode: () => ({ name: nodeName, type: 'n8n-nodes-conduyt.conduyt', typeVersion: 1, position: [0, 0], parameters: {} }),
 		getWorkflow: () => ({ id: 'wf-1' }),
 		getExecutionId: () => executionId,
 		getWorkflowDataProxy: () => ({ $thisRunIndex: 0 }),
@@ -156,14 +156,10 @@ test('a caller-supplied idempotency key is sent verbatim for SMS and email', asy
 	assert.equal(email.requests[0].headers['Idempotency-Key'], 'order-43');
 });
 
-test('crash recovery: a caller-supplied key reuses the stored envelope under a new execution id with no root execution id saved', async () => {
+test('ordinary retry (flow context carried over): a caller key reuses the stored envelope, same as the generated path', async () => {
 	const node = new Conduyt();
 	const flow = {};
 
-	// First attempt: Conduyt would accept the request, but the worker dies before n8n
-	// persists the completed node, so only `flow` (not a saved execution row) carries
-	// forward here, and conduytRootExecutionId is never set because a caller-supplied
-	// key never calls sendIdempotencyKey.
 	const first = execution({
 		executionId: 'e1',
 		flow,
@@ -174,17 +170,15 @@ test('crash recovery: a caller-supplied key reuses the stored envelope under a n
 				contactId: 'con_1',
 				body: 'Hello from run 1',
 				fromNumber: '+15550001111',
-				idempotencyKey: 'evt-99',
+				idempotencyKey: 'order-0001',
 			})[name],
 		send: ok,
 	});
 	await node.execute.call(first);
-	assert.equal(flow.conduytRootExecutionId, undefined);
 
-	// Retry under a brand-new execution id, expressions re-evaluated to a different body.
-	// The caller key is read fresh from the item every time, so it is identical without
-	// needing conduytRootExecutionId, and the stored envelope is reused rather than resent
-	// with the changed body.
+	// Retry On Fail / manual Retry with the SAME saved flow object, expressions re-evaluated
+	// to a different body. The slot (node + run index + item index) is unchanged, so the
+	// cached envelope is reused rather than resent with the changed body.
 	const retry = execution({
 		executionId: 'e2',
 		flow,
@@ -195,16 +189,205 @@ test('crash recovery: a caller-supplied key reuses the stored envelope under a n
 				contactId: 'con_1',
 				body: 'Hello from run 2 (changed)',
 				fromNumber: '+15550001111',
-				idempotencyKey: 'evt-99',
+				idempotencyKey: 'order-0001',
 			})[name],
 		send: ok,
 	});
 	await node.execute.call(retry);
 
 	assert.deepEqual(retry.requests[0], first.requests[0]);
-	assert.equal(retry.requests[0].body.idempotencyKey, 'evt-99');
+	assert.equal(retry.requests[0].body.idempotencyKey, 'order-0001');
 	assert.equal(retry.requests[0].body.body, 'Hello from run 1');
-	assert.equal(flow.conduytRootExecutionId, undefined, 'caller-key path never touches the root execution id');
+});
+
+test('crash recovery (fresh flow state): the caller key stays stable on its own, but the snapshot does not survive, only the key does', async () => {
+	const node = new Conduyt();
+
+	// First attempt: Conduyt would accept the request, but the worker dies before n8n
+	// persists the completed node, so the saved execution carries NO flow context forward
+	// at all (a brand-new, empty flow object below, not the same reference) — the true
+	// crash case, unlike an ordinary retry where flow context survives.
+	const first = execution({
+		executionId: 'e1',
+		flow: {},
+		items: 1,
+		params: (name) =>
+			({
+				channel: 'sms',
+				contactId: 'con_1',
+				body: 'Hello, stable item data',
+				fromNumber: '+15550001111',
+				idempotencyKey: 'order-0002',
+			})[name],
+		send: ok,
+	});
+	await node.execute.call(first);
+
+	// Retry under a fresh execution id AND fresh flow context (nothing carried over). The
+	// caller key does not depend on flow context, so it alone is still identical. With the
+	// SAME, deterministic item data (as upstream data should be), the freshly re-evaluated
+	// payload also happens to match — but that is because the inputs match, not because any
+	// snapshot was reused; there is no snapshot available here to reuse.
+	const retry = execution({
+		executionId: 'e2',
+		flow: {},
+		items: 1,
+		params: (name) =>
+			({
+				channel: 'sms',
+				contactId: 'con_1',
+				body: 'Hello, stable item data',
+				fromNumber: '+15550001111',
+				idempotencyKey: 'order-0002',
+			})[name],
+		send: ok,
+	});
+	await node.execute.call(retry);
+
+	assert.equal(retry.requests[0].body.idempotencyKey, first.requests[0].body.idempotencyKey);
+	assert.equal(retry.requests[0].body.body, first.requests[0].body.body);
+});
+
+test('documents the caveat: a caller key does not protect a non-deterministic payload across a crash', async () => {
+	const node = new Conduyt();
+
+	// Same crash shape as above (fresh flow both times), but the upstream item data is NOT
+	// deterministic between attempts (for example a body built from $now). The key is still
+	// identical, because it never depended on flow context, but the resent payload differs:
+	// the snapshot genuinely did not survive, only the key did, exactly as documented in the
+	// node notice, the field description, and the README.
+	const first = execution({
+		executionId: 'e1',
+		flow: {},
+		items: 1,
+		params: (name) =>
+			({
+				channel: 'sms',
+				contactId: 'con_1',
+				body: 'Hello from run 1',
+				fromNumber: '+15550001111',
+				idempotencyKey: 'order-0003',
+			})[name],
+		send: ok,
+	});
+	await node.execute.call(first);
+
+	const retry = execution({
+		executionId: 'e2',
+		flow: {},
+		items: 1,
+		params: (name) =>
+			({
+				channel: 'sms',
+				contactId: 'con_1',
+				body: 'Hello from run 2 (changed)',
+				fromNumber: '+15550001111',
+				idempotencyKey: 'order-0003',
+			})[name],
+		send: ok,
+	});
+	await node.execute.call(retry);
+
+	assert.equal(retry.requests[0].body.idempotencyKey, first.requests[0].body.idempotencyKey);
+	assert.notEqual(retry.requests[0].body.body, first.requests[0].body.body);
+});
+
+test('a caller key reused by a different item in the same execution is rejected, not silently replayed', async () => {
+	const node = new Conduyt();
+	const ctx = execution({
+		executionId: 'e1',
+		flow: {},
+		items: 2,
+		params: (name, i) =>
+			({
+				channel: 'sms',
+				contactId: `con_${i}`,
+				body: `Body for item ${i}`,
+				fromNumber: '+15550001111',
+				idempotencyKey: 'shared-key-01',
+			})[name],
+		send: ok,
+	});
+
+	await assert.rejects(() => node.execute.call(ctx), /already in use/);
+	// The first item's request went out before the second item's collision was caught; the
+	// second item's request never fires with the first item's (wrong) envelope.
+	assert.equal(ctx.requests.length, 1);
+	assert.equal(ctx.requests[0].body.contactId, 'con_0');
+});
+
+test('a caller key reused by a different node is rejected, not silently replayed', async () => {
+	const node = new Conduyt();
+	const flow = {};
+
+	const nodeA = execution({
+		executionId: 'e1',
+		flow,
+		nodeName: 'Send SMS A',
+		items: 1,
+		params: (name) =>
+			({
+				channel: 'sms',
+				contactId: 'con_a',
+				body: 'From node A',
+				fromNumber: '+15550001111',
+				idempotencyKey: 'shared-key-02',
+			})[name],
+		send: ok,
+	});
+	await node.execute.call(nodeA);
+	assert.equal(nodeA.requests.length, 1);
+
+	const nodeB = execution({
+		executionId: 'e1',
+		flow,
+		nodeName: 'Send SMS B',
+		items: 1,
+		params: (name) =>
+			({
+				channel: 'sms',
+				contactId: 'con_b',
+				body: 'From node B',
+				fromNumber: '+15550001111',
+				idempotencyKey: 'shared-key-02',
+			})[name],
+		send: ok,
+	});
+	await assert.rejects(() => node.execute.call(nodeB), /already in use/);
+	assert.equal(nodeB.requests.length, 0);
+});
+
+test('a caller key outside the server length bounds is rejected before sending', async () => {
+	const node = new Conduyt();
+	const shortSms = execution({
+		executionId: 'e1',
+		flow: {},
+		items: 1,
+		params: (name) =>
+			({ channel: 'sms', contactId: 'con_1', body: 'Hi', fromNumber: '+15550001111', idempotencyKey: 'short' })[
+				name
+			],
+		send: ok,
+	});
+	await assert.rejects(() => node.execute.call(shortSms), /8 to 200 characters/);
+	assert.equal(shortSms.requests.length, 0);
+
+	const longEmail = execution({
+		executionId: 'e2',
+		flow: {},
+		items: 1,
+		params: (name) =>
+			({
+				channel: 'email',
+				contactId: 'con_1',
+				body: 'Hi',
+				subject: 'S',
+				idempotencyKey: 'x'.repeat(256),
+			})[name],
+		send: ok,
+	});
+	await assert.rejects(() => node.execute.call(longEmail), /at most 255 characters/);
+	assert.equal(longEmail.requests.length, 0);
 });
 
 test('the snapshot survives a JSON round trip of the saved run data', async () => {
