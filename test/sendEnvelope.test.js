@@ -522,6 +522,48 @@ test('a later item failing does not cause an earlier unconfirmed SMS to be sent 
 	assert.equal(out[0][1].json.deliveryUnconfirmed, undefined);
 });
 
+test('documents the limit: a worker crash before n8n saves the run loses the unconfirmed-SMS replay protection', async () => {
+	const node = new Conduyt();
+
+	// The protection above relies entirely on flow context (conduytSendUnconfirmed) that
+	// n8n only carries forward once it has saved the run. A true crash, exactly like the
+	// one the generated/caller-key notes already document for the envelope snapshot, loses
+	// that context: the retry below gets a brand-new, empty flow object, not the same
+	// reference, so there is nothing to replay and the endpoint is called again. This test
+	// pins that gap rather than hiding it; the fix lives outside this repo (a server-backed
+	// replay lookup in Conduyt itself), so the node notice, field description, and README
+	// disclose it instead of claiming a guarantee this client alone cannot make.
+	const first = execution({
+		executionId: 'e1',
+		flow: {},
+		items: 1,
+		params: (name) =>
+			({ channel: 'sms', contactId: 'con_1', body: 'Hi', fromNumber: '+15550001111', idempotencyKey: 'order-0004' })[
+				name
+			],
+		send: deliveryUnconfirmed,
+	});
+	const out1 = await node.execute.call(first);
+	assert.equal(first.requests.length, 1);
+	assert.equal(out1[0][0].json.deliveryUnconfirmed, true);
+
+	const retry = execution({
+		executionId: 'e2',
+		flow: {},
+		items: 1,
+		params: (name) =>
+			({ channel: 'sms', contactId: 'con_1', body: 'Hi', fromNumber: '+15550001111', idempotencyKey: 'order-0004' })[
+				name
+			],
+		send: ok,
+	});
+	const out2 = await node.execute.call(retry);
+	// A second request really does go out: there is no cached outcome to replay it from.
+	assert.equal(retry.requests.length, 1);
+	assert.equal(retry.requests[0].body.idempotencyKey, 'order-0004');
+	assert.equal(out2[0][0].json.deliveryUnconfirmed, undefined);
+});
+
 test('a whitespace-only caller key is rejected for SMS and email, not silently treated as unset', async () => {
 	const node = new Conduyt();
 	const sms = execution({
@@ -550,5 +592,90 @@ test('a whitespace-only caller key is rejected for SMS and email, not silently t
 		send: ok,
 	});
 	await assert.rejects(() => node.execute.call(email), /leading or trailing whitespace/);
+	assert.equal(email.requests.length, 0);
+});
+
+test('a numeric caller key (an upstream ID that stayed a number) is coerced to its decimal string, for SMS and email', async () => {
+	const node = new Conduyt();
+	const sms = execution({
+		executionId: 'e1',
+		flow: {},
+		items: 1,
+		params: (name) =>
+			({
+				channel: 'sms',
+				contactId: 'con_1',
+				body: 'Hi',
+				fromNumber: '+15550001111',
+				idempotencyKey: 20260101123,
+			})[name],
+		send: ok,
+	});
+	await node.execute.call(sms);
+	assert.equal(sms.requests[0].body.idempotencyKey, '20260101123');
+
+	const email = execution({
+		executionId: 'e2',
+		flow: {},
+		items: 1,
+		params: (name) => ({ channel: 'email', contactId: 'con_1', body: 'Hi', subject: 'S', idempotencyKey: 42 })[name],
+		send: ok,
+	});
+	await node.execute.call(email);
+	assert.equal(email.requests[0].headers['Idempotency-Key'], '42');
+});
+
+test('a null caller key (an upstream expression that resolved to no value) is treated as unset, for SMS and email', async () => {
+	const node = new Conduyt();
+	const sms = execution({
+		executionId: 'e1',
+		flow: {},
+		items: 1,
+		params: (name) =>
+			({ channel: 'sms', contactId: 'con_1', body: 'Hi', fromNumber: '+15550001111', idempotencyKey: null })[name],
+		send: ok,
+	});
+	await node.execute.call(sms);
+	assert.match(sms.requests[0].body.idempotencyKey, /^n8n-[0-9a-f]{64}$/);
+
+	const email = execution({
+		executionId: 'e2',
+		flow: {},
+		items: 1,
+		params: (name) => ({ channel: 'email', contactId: 'con_1', body: 'Hi', subject: 'S', idempotencyKey: null })[name],
+		send: ok,
+	});
+	await node.execute.call(email);
+	assert.match(email.requests[0].headers['Idempotency-Key'], /^n8n-[0-9a-f]{64}$/);
+});
+
+test('a non-string, non-number caller key (an object or array) is rejected with a clear error, for SMS and email', async () => {
+	const node = new Conduyt();
+	const sms = execution({
+		executionId: 'e1',
+		flow: {},
+		items: 1,
+		params: (name) =>
+			({
+				channel: 'sms',
+				contactId: 'con_1',
+				body: 'Hi',
+				fromNumber: '+15550001111',
+				idempotencyKey: { oops: true },
+			})[name],
+		send: ok,
+	});
+	await assert.rejects(() => node.execute.call(sms), /Idempotency Key must be a string or number/);
+	assert.equal(sms.requests.length, 0);
+
+	const email = execution({
+		executionId: 'e2',
+		flow: {},
+		items: 1,
+		params: (name) =>
+			({ channel: 'email', contactId: 'con_1', body: 'Hi', subject: 'S', idempotencyKey: ['a', 'b'] })[name],
+		send: ok,
+	});
+	await assert.rejects(() => node.execute.call(email), /Idempotency Key must be a string or number/);
 	assert.equal(email.requests.length, 0);
 });

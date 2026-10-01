@@ -433,7 +433,7 @@ export class Conduyt implements INodeType {
 			},
 			{
 				displayName:
-					'Each item is sent with its own idempotency key, so Retry On Fail and a manual Retry of a failed execution do not resend a request Conduyt already confirmed. An SMS whose delivery Conduyt could not confirm is reported on the item instead, flagged deliveryUnconfirmed, and is never retried by this node; you decide whether to send it again. For email Conduyt keeps the key for 24 hours: a retry within 24 hours never sends twice, a retry after 24 hours sends the email again. Set Idempotency Key below to supply your own key from the upstream item instead: the key itself survives a worker crash between Conduyt accepting the request and n8n saving the run, but the saved request snapshot does not, so give the same key the same item data every time. Each key must belong to one item, with no leading or trailing whitespace; reusing it for a different item or node is rejected.',
+					'Each item is sent with its own idempotency key, so Retry On Fail and a manual Retry of a failed execution do not resend a request Conduyt already confirmed. An SMS whose delivery Conduyt could not confirm is reported on the item instead, flagged deliveryUnconfirmed, and is never retried by this node within the same saved run; you decide whether to send it again. That protection lives in the run n8n saves after the report: a worker crash before n8n saves it loses the record, and Conduyt still allows another dispatch under the same key, so a retry after such a crash can resend it; check the conversation before retrying when you cannot rule that out. For email Conduyt keeps the key for 24 hours: a retry within 24 hours never sends twice, a retry after 24 hours sends the email again. Set Idempotency Key below to supply your own key from the upstream item instead: the key itself survives a worker crash between Conduyt accepting the request and n8n saving the run, but the saved request snapshot does not, so give the same key the same item data every time. Each key must belong to one item, with no leading or trailing whitespace; reusing it for a different item or node is rejected.',
 				name: 'sendRetryNotice',
 				type: 'notice',
 				default: '',
@@ -490,7 +490,7 @@ export class Conduyt implements INodeType {
 				type: 'string',
 				default: '',
 				description:
-					'Map a unique ID from the upstream item, such as the record or event ID, sent exactly as given (SMS: 8 to 200 characters; email: up to 255). The key stays stable across any retry, including one after a worker crash, but the saved snapshot of the request does not survive that crash, only the key does, so the same key must always come with the same item data. Reusing a key for a different item or node is rejected, and so is one with leading or trailing whitespace. Left empty, the node generates a key that holds, snapshot included, for retries of the same execution, but a worker crash between Conduyt accepting the request and n8n saving the run can send it again.',
+					'Map a unique ID from the upstream item, such as the record or event ID, sent exactly as given (SMS: 8 to 200 characters; email: up to 255). The key stays stable across any retry, including one after a worker crash, but the saved snapshot of the request does not survive that crash, only the key does, so the same key must always come with the same item data. A stable key does not cover an SMS reported deliveryUnconfirmed: Conduyt still allows another dispatch under the same key, so a worker crash before n8n saves the run can resend it on retry regardless of whether the key is generated or supplied here. Reusing a key for a different item or node is rejected, and so is one with leading or trailing whitespace. Left empty, the node generates a key that holds, snapshot included, for retries of the same execution, but a worker crash between Conduyt accepting the request and n8n saving the run can send it again.',
 				displayOptions: show('message', 'send'),
 			},
 
@@ -604,7 +604,7 @@ export class Conduyt implements INodeType {
 					const envelope = sendEnvelope.call(
 						this,
 						i,
-						this.getNodeParameter('idempotencyKey', i, '') as string,
+						this.getNodeParameter('idempotencyKey', i, ''),
 						() => ({
 							channel: this.getNodeParameter('channel', i) as string,
 							contactId: this.getNodeParameter('contactId', i) as string,

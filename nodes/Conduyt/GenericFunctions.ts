@@ -238,6 +238,25 @@ function sendSlot(this: IExecuteFunctions, itemIndex: number): string {
 	return createHash('sha256').update(parts.join('\n')).digest('hex');
 }
 
+/**
+ * Normalizes the raw Idempotency Key parameter, which n8n hands over as whatever an
+ * expression resolved to, not guaranteed to be a string. An upstream record or event ID
+ * often stays a number end to end, so that becomes its decimal string rather than a reject;
+ * undefined, null, and the exact empty string all mean "not supplied"; anything else that
+ * is not a string or number (an object, a boolean, an array) is a mistake worth a clear
+ * error here, not a `callerKey.trim is not a function` further down.
+ */
+function normalizeCallerKey(node: INode, raw: unknown, itemIndex: number): string | undefined {
+	if (raw === undefined || raw === null || raw === '') return undefined;
+	if (typeof raw === 'string') return raw;
+	if (typeof raw === 'number' || typeof raw === 'bigint') return String(raw);
+	throw new NodeOperationError(
+		node,
+		`Idempotency Key must be a string or number, got ${typeof raw}`,
+		{ itemIndex },
+	);
+}
+
 /** Conduyt's own key-length bounds, checked here so a bad key fails before the request goes out. */
 function assertCallerKeyLength(node: INode, channel: string, key: string, itemIndex: number): void {
 	if (channel === 'sms') {
@@ -266,10 +285,11 @@ function assertCallerKeyLength(node: INode, channel: string, key: string, itemIn
  * stable send slot, which rides the saved run data into every retry of the family, and
  * every later attempt against that same slot reuses it.
  *
- * `callerKey`, when not the exact empty string (a whitespace-only value still counts as
- * supplied, and is rejected below, not silently treated as unset; the key is cached and
- * sent exactly as given), is used as the idempotency key instead of the
- * generated one, and skips `sendIdempotencyKey` (and its `conduytRootExecutionId` flow
+ * `callerKey` is the raw Idempotency Key parameter (see `normalizeCallerKey`: a number
+ * is coerced, not rejected). Once normalized, anything but the exact empty string (a
+ * whitespace-only value still counts as supplied, and is rejected below, not silently
+ * treated as unset; the key is cached and sent exactly as given) is used as the idempotency
+ * key instead of the generated one, and skips `sendIdempotencyKey` (and its `conduytRootExecutionId` flow
  * write) entirely: the key then comes straight from the item's own data on every attempt,
  * so it is already identical on a retry even if the flow context never reached a saved
  * execution (a crash between Conduyt accepting the request and n8n persisting the run).
@@ -285,7 +305,7 @@ function assertCallerKeyLength(node: INode, channel: string, key: string, itemIn
 export function sendEnvelope(
 	this: IExecuteFunctions,
 	itemIndex: number,
-	callerKey: string,
+	callerKeyInput: unknown,
 	evaluate: () => Omit<SendEnvelope, 'idempotencyKey'>,
 ): SendEnvelope {
 	const slot = sendSlot.call(this, itemIndex);
@@ -297,10 +317,12 @@ export function sendEnvelope(
 	const stored = envelopes[slot];
 	if (isSendEnvelope(stored)) return stored;
 
-	// Only the exact empty string (the field's default) counts as "not supplied": a
-	// whitespace-only value is something the caller typed, not nothing, and must hit the
-	// same rejection below rather than silently falling back to a generated key.
-	const hasCallerKey = callerKey !== '';
+	// undefined, null, and the exact empty string (the field's default) all count as "not
+	// supplied"; anything else, number included, was typed as a key and must hit the
+	// whitespace rejection below rather than silently falling back to a generated key.
+	const normalized = normalizeCallerKey(this.getNode(), callerKeyInput, itemIndex);
+	const hasCallerKey = normalized !== undefined;
+	const callerKey = normalized ?? '';
 	if (hasCallerKey && callerKey !== callerKey.trim()) {
 		throw new NodeOperationError(
 			this.getNode(),
