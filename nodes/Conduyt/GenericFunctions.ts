@@ -8,6 +8,7 @@ import type {
 	JsonObject,
 } from 'n8n-workflow';
 import { NodeApiError } from 'n8n-workflow';
+import { createHash } from 'crypto';
 
 type ConduytContext = IExecuteFunctions | IHookFunctions | ILoadOptionsFunctions;
 
@@ -37,6 +38,7 @@ export async function conduytApiRequest(
 	endpoint: string,
 	body: IDataObject = {},
 	qs: IDataObject = {},
+	headers: Record<string, string> = {},
 ): Promise<unknown> {
 	const credentials = await this.getCredentials('conduytApi');
 	const baseUrl = ((credentials.baseUrl as string) || 'https://conduyt.app/api/v1').replace(
@@ -53,6 +55,7 @@ export async function conduytApiRequest(
 		headers: {
 			Accept: 'application/json',
 			'User-Agent': 'n8n-nodes-conduyt',
+			...headers,
 		},
 	};
 	if (Object.keys(body).length === 0) delete options.body;
@@ -107,6 +110,22 @@ export async function conduytApiRequestAllItems(
 		page += 1;
 	}
 	return results;
+}
+
+/**
+ * Stable per-item key for a send inside one execution, so an n8n retry (Retry On Fail,
+ * or a network timeout after Conduyt already handed the message to the provider) is
+ * deduplicated by the API instead of sent twice. A fresh execution gets a fresh key.
+ * Hashed so the key stays within the API's length caps whatever the node name is.
+ */
+export function sendIdempotencyKey(this: IExecuteFunctions, itemIndex: number): string {
+	const parts = [
+		this.getWorkflow().id ?? '',
+		this.getExecutionId(),
+		this.getNode().name,
+		String(itemIndex),
+	];
+	return `n8n-${createHash('sha256').update(parts.join('\n')).digest('hex')}`;
 }
 
 /** Drop undefined / empty-string keys so PATCH bodies only carry real changes. */

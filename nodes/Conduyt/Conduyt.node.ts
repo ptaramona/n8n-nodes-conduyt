@@ -16,6 +16,7 @@ import {
 	clean,
 	conduytApiRequest,
 	conduytApiRequestAllItems,
+	sendIdempotencyKey,
 	splitTags,
 } from './GenericFunctions';
 
@@ -447,32 +448,10 @@ export class Conduyt implements INodeType {
 				displayOptions: show('message', 'send'),
 			},
 			{
-				displayName: 'To (Email)',
-				name: 'to',
-				type: 'string',
-				placeholder: 'name@email.com',
-				default: '',
-				required: true,
-				description: "The recipient's email address (the contact's email)",
-				displayOptions: { show: { resource: ['message'], operation: ['send'], channel: ['email'] } },
-			},
-			{
 				displayName: 'Subject',
 				name: 'subject',
 				type: 'string',
 				default: '',
-				required: true,
-				displayOptions: { show: { resource: ['message'], operation: ['send'], channel: ['email'] } },
-			},
-			{
-				displayName: 'Body Format',
-				name: 'bodyFormat',
-				type: 'options',
-				options: [
-					{ name: 'Plain Text', value: 'text' },
-					{ name: 'HTML', value: 'html' },
-				],
-				default: 'text',
 				displayOptions: { show: { resource: ['message'], operation: ['send'], channel: ['email'] } },
 			},
 			{
@@ -481,7 +460,8 @@ export class Conduyt implements INodeType {
 				type: 'string',
 				placeholder: '+15555550123',
 				default: '',
-				description: "The workspace number to send from. Leave empty to use the account's primary number.",
+				description:
+					"The number to send from: the account's number or an assigned agent line (DID). Leave empty to use the sending user's assigned line when they have one, otherwise the account number.",
 				displayOptions: { show: { resource: ['message'], operation: ['send'], channel: ['sms'] } },
 			},
 			{
@@ -598,25 +578,14 @@ export class Conduyt implements INodeType {
 					}
 					result = await conduytApiRequest.call(this, 'POST', basePath, body);
 				} else if (resource === 'message' && operation === 'send') {
-					// 0.1.6: outbound sends go through the delivery endpoints (provider delivery and compliance checks run there);
-					// POST /messages only logs a message and refuses outbound SMS
+					// Both paths carry a per-item idempotency key so a retry never double-sends.
 					const channel = this.getNodeParameter('channel', i) as string;
 					const contactId = this.getNodeParameter('contactId', i) as string;
 					const text = this.getNodeParameter('body', i) as string;
-					if (channel === 'email') {
-						const format = this.getNodeParameter('bodyFormat', i, 'text') as string;
-						result = await conduytApiRequest.call(
-							this,
-							'POST',
-							'/email/send',
-							clean({
-								to: this.getNodeParameter('to', i) as string,
-								subject: this.getNodeParameter('subject', i) as string,
-								contactId,
-								[format === 'html' ? 'html' : 'text']: text,
-							}),
-						);
-					} else {
+					const idempotencyKey = sendIdempotencyKey.call(this, i);
+					if (channel === 'sms') {
+						// 0.1.6: outbound SMS goes through the delivery endpoint (provider delivery and
+						// compliance checks run there); POST /messages refuses outbound SMS.
 						result = await conduytApiRequest.call(
 							this,
 							'POST',
@@ -625,7 +594,25 @@ export class Conduyt implements INodeType {
 								contactId,
 								body: text,
 								fromNumber: this.getNodeParameter('fromNumber', i, '') as string,
+								idempotencyKey,
 							}),
+						);
+					} else {
+						// Email stays on POST /messages (as in 0.1.5): the API resolves the recipient
+						// from the contact and renders merge fields.
+						result = await conduytApiRequest.call(
+							this,
+							'POST',
+							basePath,
+							clean({
+								contactId,
+								channel,
+								direction: 'outbound',
+								subject: this.getNodeParameter('subject', i) as string,
+								body: text,
+							}),
+							{},
+							{ 'Idempotency-Key': idempotencyKey },
 						);
 					}
 				} else if (resource === 'tag' && operation === 'create') {
