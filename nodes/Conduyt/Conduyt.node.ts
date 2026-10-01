@@ -447,11 +447,42 @@ export class Conduyt implements INodeType {
 				displayOptions: show('message', 'send'),
 			},
 			{
+				displayName: 'To (Email)',
+				name: 'to',
+				type: 'string',
+				placeholder: 'name@email.com',
+				default: '',
+				required: true,
+				description: "The recipient's email address (the contact's email)",
+				displayOptions: { show: { resource: ['message'], operation: ['send'], channel: ['email'] } },
+			},
+			{
 				displayName: 'Subject',
 				name: 'subject',
 				type: 'string',
 				default: '',
+				required: true,
 				displayOptions: { show: { resource: ['message'], operation: ['send'], channel: ['email'] } },
+			},
+			{
+				displayName: 'Body Format',
+				name: 'bodyFormat',
+				type: 'options',
+				options: [
+					{ name: 'Plain Text', value: 'text' },
+					{ name: 'HTML', value: 'html' },
+				],
+				default: 'text',
+				displayOptions: { show: { resource: ['message'], operation: ['send'], channel: ['email'] } },
+			},
+			{
+				displayName: 'From Number',
+				name: 'fromNumber',
+				type: 'string',
+				placeholder: '+15555550123',
+				default: '',
+				description: "The workspace number to send from. Leave empty to use the account's primary number.",
+				displayOptions: { show: { resource: ['message'], operation: ['send'], channel: ['sms'] } },
 			},
 			{
 				displayName: 'Body',
@@ -567,15 +598,36 @@ export class Conduyt implements INodeType {
 					}
 					result = await conduytApiRequest.call(this, 'POST', basePath, body);
 				} else if (resource === 'message' && operation === 'send') {
+					// 0.1.6: outbound sends go through the delivery endpoints (provider delivery and compliance checks run there);
+					// POST /messages only logs a message and refuses outbound SMS
 					const channel = this.getNodeParameter('channel', i) as string;
-					const body = clean({
-						contactId: this.getNodeParameter('contactId', i) as string,
-						channel,
-						direction: 'outbound',
-						subject: channel === 'email' ? (this.getNodeParameter('subject', i) as string) : undefined,
-						body: this.getNodeParameter('body', i) as string,
-					});
-					result = await conduytApiRequest.call(this, 'POST', basePath, body);
+					const contactId = this.getNodeParameter('contactId', i) as string;
+					const text = this.getNodeParameter('body', i) as string;
+					if (channel === 'email') {
+						const format = this.getNodeParameter('bodyFormat', i, 'text') as string;
+						result = await conduytApiRequest.call(
+							this,
+							'POST',
+							'/email/send',
+							clean({
+								to: this.getNodeParameter('to', i) as string,
+								subject: this.getNodeParameter('subject', i) as string,
+								contactId,
+								[format === 'html' ? 'html' : 'text']: text,
+							}),
+						);
+					} else {
+						result = await conduytApiRequest.call(
+							this,
+							'POST',
+							'/messages/sms/send',
+							clean({
+								contactId,
+								body: text,
+								fromNumber: this.getNodeParameter('fromNumber', i, '') as string,
+							}),
+						);
+					}
 				} else if (resource === 'tag' && operation === 'create') {
 					result = await conduytApiRequest.call(this, 'POST', basePath, {
 						name: this.getNodeParameter('name', i) as string,
