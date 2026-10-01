@@ -430,7 +430,7 @@ export class Conduyt implements INodeType {
 			},
 			{
 				displayName:
-					'Each item is sent with its own idempotency key, so Retry On Fail and a manual Retry of a failed execution never send the same message twice. For SMS the key stays with the message. For email Conduyt keeps the key for 24 hours: a retry within 24 hours never sends twice, a retry after 24 hours sends the email again.',
+					'Each item is sent with its own idempotency key, so Retry On Fail and a manual Retry of a failed execution never send the same message twice. For SMS the key stays with the message. For email Conduyt keeps the key for 24 hours: a retry within 24 hours never sends twice, a retry after 24 hours sends the email again. Set Idempotency Key below to supply your own key instead: it survives a worker crash between Conduyt accepting the request and n8n saving the run, which the generated key cannot.',
 				name: 'sendRetryNotice',
 				type: 'notice',
 				default: '',
@@ -479,6 +479,15 @@ export class Conduyt implements INodeType {
 				typeOptions: { rows: 4 },
 				default: '',
 				required: true,
+				displayOptions: show('message', 'send'),
+			},
+			{
+				displayName: 'Idempotency Key',
+				name: 'idempotencyKey',
+				type: 'string',
+				default: '',
+				description:
+					'Map a unique ID from the upstream item, such as the record or event ID. When set, it is used as the key exactly as given (SMS: 8 to 200 characters; email: up to 255) and survives any crash or retry. Left empty, the node generates a key that holds for retries of the same execution, but a worker crash between Conduyt accepting the request and n8n saving the run can send it again.',
 				displayOptions: show('message', 'send'),
 			},
 
@@ -589,13 +598,18 @@ export class Conduyt implements INodeType {
 					// Both paths carry a per-item idempotency key so a retry never double-sends. The
 					// key and the evaluated request travel together: a retry reuses the snapshot
 					// instead of re-evaluating expressions next to a reused key.
-					const envelope = sendEnvelope.call(this, i, () => ({
-						channel: this.getNodeParameter('channel', i) as string,
-						contactId: this.getNodeParameter('contactId', i) as string,
-						body: this.getNodeParameter('body', i) as string,
-						subject: this.getNodeParameter('subject', i, '') as string,
-						fromNumber: this.getNodeParameter('fromNumber', i, '') as string,
-					}));
+					const envelope = sendEnvelope.call(
+						this,
+						i,
+						this.getNodeParameter('idempotencyKey', i, '') as string,
+						() => ({
+							channel: this.getNodeParameter('channel', i) as string,
+							contactId: this.getNodeParameter('contactId', i) as string,
+							body: this.getNodeParameter('body', i) as string,
+							subject: this.getNodeParameter('subject', i, '') as string,
+							fromNumber: this.getNodeParameter('fromNumber', i, '') as string,
+						}),
+					);
 					if (envelope.channel === 'sms') {
 						// 0.1.6: outbound SMS goes through the delivery endpoint (provider delivery and
 						// compliance checks run there); POST /messages refuses outbound SMS.

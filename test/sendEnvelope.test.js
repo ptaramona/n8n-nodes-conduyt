@@ -128,6 +128,85 @@ test('a fresh execution evaluates anew: the changed channel really switches endp
 	assert.notEqual(sms.requests[0].body.idempotencyKey, email.requests[0].headers['Idempotency-Key']);
 });
 
+test('a caller-supplied idempotency key is sent verbatim for SMS and email', async () => {
+	const node = new Conduyt();
+	const run = (channel, idempotencyKey) =>
+		execution({
+			executionId: `caller-${channel}`,
+			flow: {},
+			items: 1,
+			params: (name) =>
+				({
+					channel,
+					contactId: 'con_1',
+					body: 'Hi',
+					subject: 'S',
+					fromNumber: channel === 'sms' ? '+15550001111' : undefined,
+					idempotencyKey,
+				})[name],
+			send: ok,
+		});
+
+	const sms = run('sms', 'order-42');
+	await node.execute.call(sms);
+	assert.equal(sms.requests[0].body.idempotencyKey, 'order-42');
+
+	const email = run('email', 'order-43');
+	await node.execute.call(email);
+	assert.equal(email.requests[0].headers['Idempotency-Key'], 'order-43');
+});
+
+test('crash recovery: a caller-supplied key reuses the stored envelope under a new execution id with no root execution id saved', async () => {
+	const node = new Conduyt();
+	const flow = {};
+
+	// First attempt: Conduyt would accept the request, but the worker dies before n8n
+	// persists the completed node, so only `flow` (not a saved execution row) carries
+	// forward here, and conduytRootExecutionId is never set because a caller-supplied
+	// key never calls sendIdempotencyKey.
+	const first = execution({
+		executionId: 'e1',
+		flow,
+		items: 1,
+		params: (name) =>
+			({
+				channel: 'sms',
+				contactId: 'con_1',
+				body: 'Hello from run 1',
+				fromNumber: '+15550001111',
+				idempotencyKey: 'evt-99',
+			})[name],
+		send: ok,
+	});
+	await node.execute.call(first);
+	assert.equal(flow.conduytRootExecutionId, undefined);
+
+	// Retry under a brand-new execution id, expressions re-evaluated to a different body.
+	// The caller key is read fresh from the item every time, so it is identical without
+	// needing conduytRootExecutionId, and the stored envelope is reused rather than resent
+	// with the changed body.
+	const retry = execution({
+		executionId: 'e2',
+		flow,
+		items: 1,
+		params: (name) =>
+			({
+				channel: 'sms',
+				contactId: 'con_1',
+				body: 'Hello from run 2 (changed)',
+				fromNumber: '+15550001111',
+				idempotencyKey: 'evt-99',
+			})[name],
+		send: ok,
+	});
+	await node.execute.call(retry);
+
+	assert.deepEqual(retry.requests[0], first.requests[0]);
+	assert.equal(retry.requests[0].body.idempotencyKey, 'evt-99');
+	assert.equal(retry.requests[0].body.body, 'Hello from run 1');
+	assert.equal(flow.conduytRootExecutionId, undefined, 'caller-key path never touches the root execution id');
+});
+
 test('the snapshot survives a JSON round trip of the saved run data', async () => {
 	const node = new Conduyt();
 	const flow = {};

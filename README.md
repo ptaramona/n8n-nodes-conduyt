@@ -27,7 +27,7 @@ Follow the [community nodes installation guide](https://docs.n8n.io/integrations
 
 Tags on Create / Update Contact must already exist in your account. Custom fields are passed as a JSON object.
 
-Message > Send gives every item its own idempotency key and keeps the evaluated request with it, so Retry On Fail and a manual Retry of a failed execution resend the same request under the same key and Conduyt does not send it twice. For SMS the key stays with the message. For email Conduyt keeps the key for 24 hours: a retry within 24 hours never sends twice, a retry after 24 hours sends the email again.
+Message > Send gives every item its own idempotency key and keeps the evaluated request with it, so Retry On Fail and a manual Retry of a failed execution resend the same request under the same key and Conduyt does not send it twice. For SMS the key stays with the message. For email Conduyt keeps the key for 24 hours: a retry within 24 hours never sends twice, a retry after 24 hours sends the email again. Set Idempotency Key to supply your own, such as a record or event ID from the upstream item: it is used exactly as given (SMS: 8 to 200 characters; email: up to 255) and survives a crash between Conduyt accepting the request and n8n saving the run, which the generated key cannot. Left empty, the node still generates a key, but only for retries of the same execution.
 
 ## Trigger
 

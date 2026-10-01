@@ -173,13 +173,22 @@ function isSendEnvelope(value: unknown): value is SendEnvelope {
  * a conflict (same channel, different payload) or into a request on the other endpoint
  * (channel changed). The first evaluation is kept in the flow context, which rides the
  * saved run data into every retry of the family, and every later attempt reuses it.
+ *
+ * `callerKey`, when non-empty, is used as the idempotency key exactly as given instead of
+ * the generated one, and skips `sendIdempotencyKey` (and its `conduytRootExecutionId` flow
+ * write) entirely: the key then comes straight from the item's own data on every attempt,
+ * so it is already identical on a retry even if the flow context that would have carried
+ * a generated key never reached the saved execution (a crash between Conduyt accepting the
+ * request and n8n persisting the run). The envelope snapshot is still kept under that key
+ * the same way, so a retry with the same caller key reuses it rather than re-evaluating.
  */
 export function sendEnvelope(
 	this: IExecuteFunctions,
 	itemIndex: number,
+	callerKey: string,
 	evaluate: () => Omit<SendEnvelope, 'idempotencyKey'>,
 ): SendEnvelope {
-	const idempotencyKey = sendIdempotencyKey.call(this, itemIndex);
+	const idempotencyKey = callerKey.trim() || sendIdempotencyKey.call(this, itemIndex);
 	const flow = this.getContext('flow');
 	if (!flow[SEND_ENVELOPES_KEY] || typeof flow[SEND_ENVELOPES_KEY] !== 'object') {
 		flow[SEND_ENVELOPES_KEY] = {};
