@@ -19,6 +19,8 @@ import {
 	deliveryUnconfirmedMessage,
 	sendEnvelope,
 	splitTags,
+	storeUnconfirmedSendOutcome,
+	unconfirmedSendOutcome,
 } from './GenericFunctions';
 
 const RESOURCES = [
@@ -614,32 +616,43 @@ export class Conduyt implements INodeType {
 					if (envelope.channel === 'sms') {
 						// 0.1.6: outbound SMS goes through the delivery endpoint (provider delivery and
 						// compliance checks run there); POST /messages refuses outbound SMS.
-						try {
-							result = await conduytApiRequest.call(
-								this,
-								'POST',
-								'/messages/sms/send',
-								clean({
-									contactId: envelope.contactId,
-									body: envelope.body,
-									fromNumber: envelope.fromNumber,
-									idempotencyKey: envelope.idempotencyKey,
-								}),
-							);
-						} catch (error) {
-							const unconfirmed = deliveryUnconfirmedMessage(error);
-							if (!unconfirmed) throw error;
-							// Conduyt treats a same-key deliveryUnconfirmed row as free to dispatch again, and
-							// n8n retries any thrown node error when Retry On Fail is on, so throwing here
-							// risks the exact double-send this node exists to prevent. Report it on the item
-							// instead, success or not: the node never retries an unconfirmed send on its own,
-							// the user decides whether to send it again.
-							result = {
-								...unconfirmed,
-								deliveryUnconfirmed: true,
-								warning:
-									'Conduyt could not confirm this SMS reached the recipient; the provider may already have delivered it. This node does not retry an unconfirmed send automatically, check delivery before sending again.',
-							};
+						const cachedUnconfirmed = unconfirmedSendOutcome.call(this, i);
+						if (cachedUnconfirmed) {
+							// A LATER item threw on a previous attempt, so n8n reran every item in this
+							// node, including this one, which already got a terminal-but-ambiguous result.
+							// Conduyt itself would dispatch a deliveryUnconfirmed row again under the same
+							// key, so replay the stored outcome instead of calling the endpoint again.
+							result = cachedUnconfirmed;
+						} else {
+							try {
+								result = await conduytApiRequest.call(
+									this,
+									'POST',
+									'/messages/sms/send',
+									clean({
+										contactId: envelope.contactId,
+										body: envelope.body,
+										fromNumber: envelope.fromNumber,
+										idempotencyKey: envelope.idempotencyKey,
+									}),
+								);
+							} catch (error) {
+								const unconfirmed = deliveryUnconfirmedMessage(error);
+								if (!unconfirmed) throw error;
+								// Conduyt treats a same-key deliveryUnconfirmed row as free to dispatch again,
+								// and n8n retries any thrown node error when Retry On Fail is on, so throwing
+								// here risks the exact double-send this node exists to prevent. Report it on
+								// the item instead, success or not: the node never retries an unconfirmed send
+								// on its own, the user decides whether to send it again. Cached by slot so a
+								// later item's failure can't cause this one to be sent again on retry.
+								result = {
+									...unconfirmed,
+									deliveryUnconfirmed: true,
+									warning:
+										'Conduyt could not confirm this SMS reached the recipient; the provider may already have delivered it. This node does not retry an unconfirmed send automatically, check delivery before sending again.',
+								};
+								storeUnconfirmedSendOutcome.call(this, i, result as IDataObject);
+							}
 						}
 					} else {
 						// Email stays on POST /messages (as in 0.1.5): the API resolves the recipient

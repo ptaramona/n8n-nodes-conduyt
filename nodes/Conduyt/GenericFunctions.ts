@@ -33,6 +33,20 @@ export function unwrap(body: unknown): unknown {
 	return body;
 }
 
+/**
+ * The first candidate that is a plain, non-array object, in priority order. An upstream
+ * error's parsed response body can live under several different property names depending
+ * on how far n8n has already wrapped it (see `conduytApiRequest`'s catch block).
+ */
+function firstResponseBody(...candidates: unknown[]): JsonObject {
+	for (const candidate of candidates) {
+		if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+			return candidate as JsonObject;
+		}
+	}
+	return {};
+}
+
 export async function conduytApiRequest(
 	this: ConduytContext,
 	method: IHttpRequestMethods,
@@ -70,10 +84,23 @@ export async function conduytApiRequest(
 		);
 		return unwrap(response);
 	} catch (error) {
-		const err = error as JsonObject & { message?: string; description?: string };
-		const responseBody = ((err.response as JsonObject | undefined)?.body ??
-			(err.error as JsonObject | undefined) ??
-			{}) as JsonObject;
+		const err = error as JsonObject & {
+			message?: string;
+			description?: string;
+			context?: { data?: unknown };
+			response?: { body?: unknown; data?: unknown };
+		};
+		// n8n's authenticated HTTP helper wraps a failed request as a NodeApiError, whose
+		// constructor has already parsed the response into `context.data`, never
+		// `response.body`. A raw Axios error (anything that reaches here before n8n's own
+		// wrapping) carries it at `response.data` instead. Our own `.body` convention, and
+		// finally `.error`, are checked last, for whatever shape a caller is mocked with.
+		const responseBody = firstResponseBody(
+			err.context?.data,
+			err.response?.data,
+			err.response?.body,
+			err.error,
+		);
 		const apiMessage =
 			(typeof responseBody.error === 'string' && responseBody.error) ||
 			(typeof responseBody.message === 'string' && responseBody.message) ||
@@ -239,8 +266,9 @@ function assertCallerKeyLength(node: INode, channel: string, key: string, itemIn
  * stable send slot, which rides the saved run data into every retry of the family, and
  * every later attempt against that same slot reuses it.
  *
- * `callerKey`, when non-empty (trimming is used only to test for emptiness; the key is
- * cached and sent exactly as given), is used as the idempotency key instead of the
+ * `callerKey`, when not the exact empty string (a whitespace-only value still counts as
+ * supplied, and is rejected below, not silently treated as unset; the key is cached and
+ * sent exactly as given), is used as the idempotency key instead of the
  * generated one, and skips `sendIdempotencyKey` (and its `conduytRootExecutionId` flow
  * write) entirely: the key then comes straight from the item's own data on every attempt,
  * so it is already identical on a retry even if the flow context never reached a saved
@@ -269,7 +297,10 @@ export function sendEnvelope(
 	const stored = envelopes[slot];
 	if (isSendEnvelope(stored)) return stored;
 
-	const hasCallerKey = callerKey.trim() !== '';
+	// Only the exact empty string (the field's default) counts as "not supplied": a
+	// whitespace-only value is something the caller typed, not nothing, and must hit the
+	// same rejection below rather than silently falling back to a generated key.
+	const hasCallerKey = callerKey !== '';
 	if (hasCallerKey && callerKey !== callerKey.trim()) {
 		throw new NodeOperationError(
 			this.getNode(),
@@ -301,6 +332,45 @@ export function sendEnvelope(
 	const envelope: SendEnvelope = { idempotencyKey, ...fields };
 	envelopes[slot] = envelope;
 	return envelope;
+}
+
+/** Flow-context key under which a terminal, non-retryable send outcome is kept, by slot. */
+const SEND_UNCONFIRMED_KEY = 'conduytSendUnconfirmed';
+
+/**
+ * A deliveryUnconfirmed SMS (see `deliveryUnconfirmedMessage`) is terminal for this node,
+ * but not for Conduyt: unlike every other response this node handles, which Conduyt dedupes
+ * server-side by key, Conduyt treats a deliveryUnconfirmed row as still free to dispatch
+ * under the same key. If a LATER item throws, n8n's Retry On Fail or a manual Retry of the
+ * whole failed execution reruns every item in this node, including one that already got
+ * this result, and resending it would call the live endpoint again. Caching it here, by the
+ * same stable send slot as the envelope, lets the node replay the stored outcome on a later
+ * attempt within the family instead of calling out.
+ */
+export function unconfirmedSendOutcome(
+	this: IExecuteFunctions,
+	itemIndex: number,
+): IDataObject | undefined {
+	const slot = sendSlot.call(this, itemIndex);
+	const flow = this.getContext('flow');
+	const outcomes = flow[SEND_UNCONFIRMED_KEY] as Record<string, unknown> | undefined;
+	const stored = outcomes?.[slot];
+	return stored && typeof stored === 'object' && !Array.isArray(stored)
+		? (stored as IDataObject)
+		: undefined;
+}
+
+export function storeUnconfirmedSendOutcome(
+	this: IExecuteFunctions,
+	itemIndex: number,
+	outcome: IDataObject,
+): void {
+	const slot = sendSlot.call(this, itemIndex);
+	const flow = this.getContext('flow');
+	if (!flow[SEND_UNCONFIRMED_KEY] || typeof flow[SEND_UNCONFIRMED_KEY] !== 'object') {
+		flow[SEND_UNCONFIRMED_KEY] = {};
+	}
+	(flow[SEND_UNCONFIRMED_KEY] as Record<string, unknown>)[slot] = outcome;
 }
 
 /** Drop undefined / empty-string keys so PATCH bodies only carry real changes. */

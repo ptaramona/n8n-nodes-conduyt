@@ -483,3 +483,72 @@ test('whitespace-equivalent caller keys for email are rejected, not silently col
 	assert.equal(ctx.requests.length, 1);
 	assert.equal(ctx.requests[0].headers['Idempotency-Key'], 'order-42');
 });
+
+test('a later item failing does not cause an earlier unconfirmed SMS to be sent again on retry', async () => {
+	const node = new Conduyt();
+	const flow = {};
+	const params = (name, i) =>
+		({ channel: 'sms', contactId: `con_${i}`, body: `Body ${i}`, fromNumber: '+15550001111' })[name];
+
+	// First attempt: item 0's SMS comes back deliveryUnconfirmed (reported, not thrown), item
+	// 1's provider call fails outright, which fails the whole node.
+	const first = execution({
+		executionId: 'e1',
+		flow,
+		items: 2,
+		params,
+		send: (_options, n) => (n === 0 ? deliveryUnconfirmed() : providerDown()),
+	});
+	await assert.rejects(() => node.execute.call(first), /provider unavailable/);
+	assert.equal(first.requests.length, 2);
+
+	// Manual Retry of the whole failed execution: n8n reruns every item in this node,
+	// including item 0, which already produced a terminal (if ambiguous) result. Conduyt
+	// would dispatch a deliveryUnconfirmed row again under the same key, so the node must
+	// not call the endpoint for item 0 a second time.
+	const retry = execution({
+		executionId: 'e2',
+		flow,
+		items: 2,
+		params,
+		send: ok,
+	});
+	const out = await node.execute.call(retry);
+	assert.equal(out[0].length, 2);
+	// Only item 1 (the one that actually failed) makes a new request.
+	assert.equal(retry.requests.length, 1);
+	assert.equal(out[0][0].json.deliveryUnconfirmed, true);
+	assert.equal(out[0][0].json.id, 'msg_1');
+	assert.equal(out[0][1].json.deliveryUnconfirmed, undefined);
+});
+
+test('a whitespace-only caller key is rejected for SMS and email, not silently treated as unset', async () => {
+	const node = new Conduyt();
+	const sms = execution({
+		executionId: 'e1',
+		flow: {},
+		items: 1,
+		params: (name) =>
+			({
+				channel: 'sms',
+				contactId: 'con_1',
+				body: 'Hi',
+				fromNumber: '+15550001111',
+				idempotencyKey: '   ',
+			})[name],
+		send: ok,
+	});
+	await assert.rejects(() => node.execute.call(sms), /leading or trailing whitespace/);
+	assert.equal(sms.requests.length, 0);
+
+	const email = execution({
+		executionId: 'e2',
+		flow: {},
+		items: 1,
+		params: (name) =>
+			({ channel: 'email', contactId: 'con_1', body: 'Hi', subject: 'S', idempotencyKey: '\t\t' })[name],
+		send: ok,
+	});
+	await assert.rejects(() => node.execute.call(email), /leading or trailing whitespace/);
+	assert.equal(email.requests.length, 0);
+});
