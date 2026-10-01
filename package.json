@@ -31,7 +31,7 @@
     "lint": "eslint nodes credentials package.json",
     "lintfix": "eslint nodes credentials package.json --fix",
     "pretest": "tsc",
-    "test": "node --test test/sendIdempotencyKey.test.js"
+    "test": "node --test test/sendIdempotencyKey.test.js test/sendEnvelope.test.js"
   },
   "files": [
     "dist"

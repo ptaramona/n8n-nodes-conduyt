@@ -145,6 +145,53 @@ export function sendIdempotencyKey(this: IExecuteFunctions, itemIndex: number): 
 	return `n8n-${createHash('sha256').update(parts.join('\n')).digest('hex')}`;
 }
 
+/** Flow-context key under which evaluated send envelopes are kept, by idempotency key. */
+const SEND_ENVELOPES_KEY = 'conduytSendEnvelopes';
+
+/** Everything a Message > Send request is built from, frozen at first evaluation. */
+export interface SendEnvelope {
+	idempotencyKey: string;
+	channel: string;
+	contactId: string;
+	body: string;
+	subject: string;
+	fromNumber: string;
+}
+
+function isSendEnvelope(value: unknown): value is SendEnvelope {
+	if (!value || typeof value !== 'object') return false;
+	const v = value as Record<string, unknown>;
+	return ['idempotencyKey', 'channel', 'contactId', 'body', 'subject', 'fromNumber'].every(
+		(field) => typeof v[field] === 'string',
+	);
+}
+
+/**
+ * The envelope that goes with an item's idempotency key. Both Conduyt endpoints bind a key
+ * to the request content, and n8n re-evaluates expressions ($now, $execution.id, ...) on a
+ * manual retry, so re-reading the parameters next to a reused key would turn a retry into
+ * a conflict (same channel, different payload) or into a request on the other endpoint
+ * (channel changed). The first evaluation is kept in the flow context, which rides the
+ * saved run data into every retry of the family, and every later attempt reuses it.
+ */
+export function sendEnvelope(
+	this: IExecuteFunctions,
+	itemIndex: number,
+	evaluate: () => Omit<SendEnvelope, 'idempotencyKey'>,
+): SendEnvelope {
+	const idempotencyKey = sendIdempotencyKey.call(this, itemIndex);
+	const flow = this.getContext('flow');
+	if (!flow[SEND_ENVELOPES_KEY] || typeof flow[SEND_ENVELOPES_KEY] !== 'object') {
+		flow[SEND_ENVELOPES_KEY] = {};
+	}
+	const envelopes = flow[SEND_ENVELOPES_KEY] as Record<string, unknown>;
+	const stored = envelopes[idempotencyKey];
+	if (isSendEnvelope(stored) && stored.idempotencyKey === idempotencyKey) return stored;
+	const envelope: SendEnvelope = { idempotencyKey, ...evaluate() };
+	envelopes[idempotencyKey] = envelope;
+	return envelope;
+}
+
 /** Drop undefined / empty-string keys so PATCH bodies only carry real changes. */
 export function clean(obj: IDataObject): IDataObject {
 	const out: IDataObject = {};

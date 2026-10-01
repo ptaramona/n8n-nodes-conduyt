@@ -16,7 +16,7 @@ import {
 	clean,
 	conduytApiRequest,
 	conduytApiRequestAllItems,
-	sendIdempotencyKey,
+	sendEnvelope,
 	splitTags,
 } from './GenericFunctions';
 
@@ -429,6 +429,14 @@ export class Conduyt implements INodeType {
 				default: 'send',
 			},
 			{
+				displayName:
+					'Each item is sent with its own idempotency key, so Retry On Fail and a manual Retry of a failed execution never send the same message twice. For SMS the key stays with the message. For email Conduyt keeps the key for 24 hours: a retry within 24 hours never sends twice, a retry after 24 hours sends the email again.',
+				name: 'sendRetryNotice',
+				type: 'notice',
+				default: '',
+				displayOptions: show('message', 'send'),
+			},
+			{
 				displayName: 'Contact ID',
 				name: 'contactId',
 				type: 'string',
@@ -578,12 +586,17 @@ export class Conduyt implements INodeType {
 					}
 					result = await conduytApiRequest.call(this, 'POST', basePath, body);
 				} else if (resource === 'message' && operation === 'send') {
-					// Both paths carry a per-item idempotency key so a retry never double-sends.
-					const channel = this.getNodeParameter('channel', i) as string;
-					const contactId = this.getNodeParameter('contactId', i) as string;
-					const text = this.getNodeParameter('body', i) as string;
-					const idempotencyKey = sendIdempotencyKey.call(this, i);
-					if (channel === 'sms') {
+					// Both paths carry a per-item idempotency key so a retry never double-sends. The
+					// key and the evaluated request travel together: a retry reuses the snapshot
+					// instead of re-evaluating expressions next to a reused key.
+					const envelope = sendEnvelope.call(this, i, () => ({
+						channel: this.getNodeParameter('channel', i) as string,
+						contactId: this.getNodeParameter('contactId', i) as string,
+						body: this.getNodeParameter('body', i) as string,
+						subject: this.getNodeParameter('subject', i, '') as string,
+						fromNumber: this.getNodeParameter('fromNumber', i, '') as string,
+					}));
+					if (envelope.channel === 'sms') {
 						// 0.1.6: outbound SMS goes through the delivery endpoint (provider delivery and
 						// compliance checks run there); POST /messages refuses outbound SMS.
 						result = await conduytApiRequest.call(
@@ -591,10 +604,10 @@ export class Conduyt implements INodeType {
 							'POST',
 							'/messages/sms/send',
 							clean({
-								contactId,
-								body: text,
-								fromNumber: this.getNodeParameter('fromNumber', i, '') as string,
-								idempotencyKey,
+								contactId: envelope.contactId,
+								body: envelope.body,
+								fromNumber: envelope.fromNumber,
+								idempotencyKey: envelope.idempotencyKey,
 							}),
 						);
 					} else {
@@ -605,14 +618,14 @@ export class Conduyt implements INodeType {
 							'POST',
 							basePath,
 							clean({
-								contactId,
-								channel,
+								contactId: envelope.contactId,
+								channel: envelope.channel,
 								direction: 'outbound',
-								subject: this.getNodeParameter('subject', i) as string,
-								body: text,
+								subject: envelope.subject,
+								body: envelope.body,
 							}),
 							{},
-							{ 'Idempotency-Key': idempotencyKey },
+							{ 'Idempotency-Key': envelope.idempotencyKey },
 						);
 					}
 				} else if (resource === 'tag' && operation === 'create') {

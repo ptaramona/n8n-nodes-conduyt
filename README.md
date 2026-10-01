@@ -27,6 +27,8 @@ Follow the [community nodes installation guide](https://docs.n8n.io/integrations
 
 Tags on Create / Update Contact must already exist in your account. Custom fields are passed as a JSON object.
 
+Message > Send gives every item its own idempotency key and keeps the evaluated request with it, so Retry On Fail and a manual Retry of a failed execution resend the same request under the same key and Conduyt does not send it twice. For SMS the key stays with the message. For email Conduyt keeps the key for 24 hours: a retry within 24 hours never sends twice, a retry after 24 hours sends the email again.
+
 ## Trigger
 
 **Conduyt Trigger** registers a webhook in your Conduyt account when the workflow is activated and removes it when deactivated. Pick one or more events, for example `contact.created`, `deal.won`, `form.submitted`, `message.received`, `appointment.booked`. Deliveries are verified against the `X-Conduyt-Signature` HMAC header using the secret Conduyt returns when the webhook is created.
