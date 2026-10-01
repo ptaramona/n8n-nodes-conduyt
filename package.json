@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-conduyt",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "n8n community node for Conduyt CRM: contacts, companies, deals, tasks, notes, messages, tags, and a webhook trigger for CRM events.",
   "keywords": [
     "n8n-community-node-package",

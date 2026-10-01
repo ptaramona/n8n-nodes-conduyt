@@ -8,6 +8,7 @@ import type {
 	INodePropertyOptions,
 	INodeType,
 	INodeTypeDescription,
+	JsonObject,
 } from 'n8n-workflow';
 import { NodeApiError, NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
 
@@ -631,8 +632,12 @@ export class Conduyt implements INodeType {
 					returnData.push({ json: { error: (error as Error).message }, pairedItem: { item: i } });
 					continue;
 				}
-				if (error instanceof NodeApiError || error instanceof NodeOperationError) throw error;
-				throw new NodeOperationError(this.getNode(), error as Error, { itemIndex: i });
+				// Both constructors return the original instance when it is already of that class,
+				// so errors raised by conduytApiRequest keep their HTTP context.
+				if (error instanceof NodeOperationError) {
+					throw new NodeOperationError(this.getNode(), error, { itemIndex: i });
+				}
+				throw new NodeApiError(this.getNode(), error as JsonObject, { itemIndex: i });
 			}
 		}
 
