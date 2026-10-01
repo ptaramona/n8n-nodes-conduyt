@@ -112,17 +112,34 @@ export async function conduytApiRequestAllItems(
 	return results;
 }
 
+/** Flow-context key that pins the first execution id of a retry family (see below). */
+const ROOT_EXECUTION_ID_KEY = 'conduytRootExecutionId';
+
 /**
- * Stable per-item key for a send inside one execution, so an n8n retry (Retry On Fail,
- * or a network timeout after Conduyt already handed the message to the provider) is
- * deduplicated by the API instead of sent twice. A fresh execution gets a fresh key.
+ * Stable per-item key for a send, so a retry is deduplicated by the API instead of sent
+ * twice: Retry On Fail, a network timeout after Conduyt already handed the message to
+ * the provider, and a manual "Retry execution" of a failed run.
+ *
+ * A manual retry gets a NEW execution id (the original survives only as `retryOf`, which
+ * nodes cannot read), but n8n resumes it from the saved run data of the failed execution,
+ * and the flow context is part of that data. So the first send in an execution pins the
+ * execution id in the flow context and every retry in the family reads it back; a fresh
+ * execution starts with an empty context and gets a fresh key.
+ *
+ * The node run index is in the hash too: a node inside a loop restarts its item indexes
+ * at 0 on every run, so item index alone would reuse the previous iteration's keys.
  * Hashed so the key stays within the API's length caps whatever the node name is.
  */
 export function sendIdempotencyKey(this: IExecuteFunctions, itemIndex: number): string {
+	const flow = this.getContext('flow');
+	if (typeof flow[ROOT_EXECUTION_ID_KEY] !== 'string') {
+		flow[ROOT_EXECUTION_ID_KEY] = this.getExecutionId();
+	}
 	const parts = [
 		this.getWorkflow().id ?? '',
-		this.getExecutionId(),
+		flow[ROOT_EXECUTION_ID_KEY] as string,
 		this.getNode().name,
+		String(this.getWorkflowDataProxy(itemIndex).$thisRunIndex),
 		String(itemIndex),
 	];
 	return `n8n-${createHash('sha256').update(parts.join('\n')).digest('hex')}`;
