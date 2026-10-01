@@ -374,6 +374,83 @@ test('a caller key reused by a different node is rejected, not silently replayed
 	assert.equal(nodeB.requests.length, 0);
 });
 
+test('a caller key equal to an inherited Object.prototype member name is accepted, not falsely rejected as already in use', async () => {
+	const node = new Conduyt();
+	// A plain-object ownership map read by bracket access on the raw key would resolve these
+	// to an inherited function instead of a real entry, and wrongly throw on the very first
+	// use of the key.
+	for (const key of ['constructor', 'toString', '__proto__']) {
+		const ctx = execution({
+			executionId: `e-${key}`,
+			flow: {},
+			items: 1,
+			params: (name) =>
+				({ channel: 'sms', contactId: 'con_1', body: 'Hi', fromNumber: '+15550001111', idempotencyKey: key })[
+					name
+				],
+			send: ok,
+		});
+		await node.execute.call(ctx);
+		assert.equal(ctx.requests.length, 1);
+		assert.equal(ctx.requests[0].body.idempotencyKey, key);
+	}
+});
+
+test('ownership tracking for a key equal to an Object.prototype member name survives a JSON round trip of the flow context', async () => {
+	const node = new Conduyt();
+	for (const key of ['constructor', 'toString', '__proto__']) {
+		const flow = {};
+		const first = execution({
+			executionId: 'e1',
+			flow,
+			items: 1,
+			params: (name) =>
+				({ channel: 'sms', contactId: 'con_1', body: 'Hi', fromNumber: '+15550001111', idempotencyKey: key })[
+					name
+				],
+			send: ok,
+		});
+		await node.execute.call(first);
+		assert.equal(first.requests.length, 1);
+
+		// n8n persists the execution data as JSON between the failure/retry and the next attempt.
+		const restored = JSON.parse(JSON.stringify(flow));
+
+		// Retry of the SAME item/slot with the SAME key: recognized as its own owner (and
+		// replayed from the confirmed-outcome cache), not "already in use".
+		const retry = execution({
+			executionId: 'e2',
+			flow: restored,
+			items: 1,
+			params: (name) =>
+				({ channel: 'sms', contactId: 'con_1', body: 'Changed', fromNumber: '+15550001111', idempotencyKey: key })[
+					name
+				],
+			send: ok,
+		});
+		await node.execute.call(retry);
+		assert.equal(retry.requests.length, 0);
+
+		// A DIFFERENT node reusing the same key after the round trip is still correctly rejected.
+		const other = execution({
+			executionId: 'e3',
+			flow: restored,
+			nodeName: 'Send SMS B',
+			items: 1,
+			params: (name) =>
+				({
+					channel: 'sms',
+					contactId: 'con_2',
+					body: 'From another node',
+					fromNumber: '+15550001111',
+					idempotencyKey: key,
+				})[name],
+			send: ok,
+		});
+		await assert.rejects(() => node.execute.call(other), /already in use/);
+	}
+});
+
 test('a caller key outside the server length bounds is rejected before sending', async () => {
 	const node = new Conduyt();
 	const shortSms = execution({
@@ -636,6 +713,78 @@ test('a later item failing does not cause an already-confirmed email send to be 
 	// Only item 1 (the one that actually failed) makes a new request.
 	assert.equal(retry.requests.length, 1);
 	assert.equal(retry.requests[0].body.contactId, 'con_1');
+});
+
+/**
+ * Runs `fn` with `Date.now` stubbed to `nowMs`, always restoring the real `Date.now`
+ * afterwards even if `fn` throws or its promise rejects. `confirmedSendOutcome` and
+ * `storeConfirmedSendOutcome` are given `Date.now()` by the node itself (never a value
+ * these tests pass in directly), so stubbing the global is the only way to fake the clock
+ * they see.
+ */
+async function withFakeNow(nowMs, fn) {
+	const realNow = Date.now;
+	Date.now = () => nowMs;
+	try {
+		return await fn();
+	} finally {
+		Date.now = realNow;
+	}
+}
+
+test('a confirmed email outcome is replayed within Conduyt\'s 24-hour key window, but genuinely re-sent once that window has passed', async () => {
+	const node = new Conduyt();
+	const flow = {};
+	const params = (name) => ({ channel: 'email', contactId: 'con_1', body: 'Hi', subject: 'S' })[name];
+
+	await withFakeNow(0, async () => {
+		const first = execution({ executionId: 'e1', flow, items: 1, params, send: ok });
+		await node.execute.call(first);
+		assert.equal(first.requests.length, 1);
+	});
+
+	// 23 hours later, inside Conduyt's documented 24-hour email key window: replayed from
+	// cache, no request at all.
+	await withFakeNow(23 * 60 * 60 * 1000, async () => {
+		const withinWindow = execution({ executionId: 'e2', flow, items: 1, params, send: ok });
+		const out = await node.execute.call(withinWindow);
+		assert.equal(withinWindow.requests.length, 0);
+		assert.equal(out[0][0].json.id, 'msg_1');
+	});
+
+	// 25 hours after the ORIGINAL send, past the window: the cached record has expired, so
+	// this is a cache miss and the node genuinely resends it, matching what Conduyt's own
+	// server-side key handling would also now allow.
+	await withFakeNow(25 * 60 * 60 * 1000, async () => {
+		const afterWindow = execution({ executionId: 'e3', flow, items: 1, params, send: ok });
+		await node.execute.call(afterWindow);
+		assert.equal(afterWindow.requests.length, 1);
+		assert.equal(afterWindow.requests[0].body.contactId, 'con_1');
+	});
+});
+
+test('a pending email response is never cached, so a retry always re-requests it, even well inside what would be the 24-hour window for a terminal result', async () => {
+	const node = new Conduyt();
+	const flow = {};
+	const params = (name) => ({ channel: 'email', contactId: 'con_1', body: 'Hi', subject: 'S' })[name];
+	const pending = () => ({ data: { id: 'msg_1', status: 'pending' } });
+
+	await withFakeNow(0, async () => {
+		const first = execution({ executionId: 'e1', flow, items: 1, params, send: pending });
+		const out = await node.execute.call(first);
+		assert.equal(first.requests.length, 1);
+		assert.equal(out[0][0].json.status, 'pending');
+	});
+
+	// Only a minute later: a terminal result would still be well within the 24-hour window,
+	// but a pending one was never cached at all, so Conduyt is asked again and its own
+	// Idempotency-Key handling resolves the retry.
+	await withFakeNow(60 * 1000, async () => {
+		const retry = execution({ executionId: 'e2', flow, items: 1, params, send: ok });
+		const out = await node.execute.call(retry);
+		assert.equal(retry.requests.length, 1);
+		assert.equal(out[0][0].json.status, 'queued');
+	});
 });
 
 test('a whitespace-only caller key is rejected for SMS and email, not silently treated as unset', async () => {

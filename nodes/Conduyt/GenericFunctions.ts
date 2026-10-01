@@ -359,7 +359,14 @@ export function sendEnvelope(
 			flow[SEND_KEY_OWNERS_KEY] = {};
 		}
 		const owners = flow[SEND_KEY_OWNERS_KEY] as Record<string, string>;
-		const owner = owners[callerKey];
+		// Looked up by a SHA-256 hex digest of the caller key, never by the caller key itself:
+		// a plain object read with bracket access also resolves an inherited Object.prototype
+		// member, so a caller key of "constructor", "toString", or "__proto__" would find that
+		// function sitting there (truthy, and never === slot) and wrongly throw "already in
+		// use" before the very first request for it goes out. A fixed-length hex digest can
+		// never collide with one of those names, so the lookup only ever finds a real entry.
+		const ownerKey = createHash('sha256').update(callerKey).digest('hex');
+		const owner = owners[ownerKey];
 		if (owner !== undefined && owner !== slot) {
 			throw new NodeOperationError(
 				this.getNode(),
@@ -367,7 +374,7 @@ export function sendEnvelope(
 				{ itemIndex },
 			);
 		}
-		owners[callerKey] = slot;
+		owners[ownerKey] = slot;
 	}
 
 	const envelope: SendEnvelope = { idempotencyKey, ...fields };
@@ -418,42 +425,88 @@ export function storeUnconfirmedSendOutcome(
 const SEND_CONFIRMED_KEY = 'conduytSendConfirmed';
 
 /**
- * A confirmed send (any email send that didn't throw, or an SMS send that didn't come back
- * deliveryUnconfirmed) is terminal and already dispatched. Only delivery-unconfirmed SMS
- * outcomes were being cached before this: if a LATER item in the same batch then threw,
- * n8n's Retry On Fail or a manual Retry of the whole failed execution reruns every item in
- * this node, including ones that already sent successfully, and nothing stopped those from
- * being sent again. Conduyt's SMS route counts a request against its per-user rate limiter
- * BEFORE it checks the idempotency key, so replaying an already-confirmed prefix on every
- * retry can spend a fresh rate-limit window on messages that already went out and never
- * reach the one item that actually still needs to send, retry after retry. Caching the
- * confirmed result by the same stable send slot as the envelope lets the node skip the
- * network call entirely for that prefix and go straight to the unsent tail.
+ * Conduyt keeps an email Idempotency-Key alive for 24 hours (documented in the README and
+ * the node notice): a retry within that window never sends twice, a retry after it sends
+ * the email again. The local confirmed-outcome cache for email has to expire on the same
+ * schedule, or a retry long after the window closed would keep replaying a stale local
+ * result instead of letting the (now genuinely new) send go out.
+ */
+export const EMAIL_CONFIRMED_SEND_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** A record kept in `SEND_CONFIRMED_KEY`, by slot. */
+interface ConfirmedSendRecord {
+	outcome: IDataObject;
+	/** `null` means the record never expires (the SMS case, see `storeConfirmedSendOutcome`). */
+	expiresAt: number | null;
+}
+
+/**
+ * Conduyt's email send can also answer with a response that has not reached a terminal
+ * state yet, such as a 202-style "accepted but not yet resolved" acceptance: the body comes
+ * back with `status: 'pending'` instead of a terminal status like `sent` or `queued`.
+ * Caching and replaying that locally would wrongly treat the send as already resolved and
+ * could skip ever actually dispatching the email; a pending result is therefore never
+ * stored, so a later attempt falls through and re-requests it, letting Conduyt's own
+ * server-side Idempotency-Key handling resolve it instead of this node guessing.
+ */
+export function isPendingEmailOutcome(result: unknown): boolean {
+	if (!result || typeof result !== 'object' || Array.isArray(result)) return false;
+	const status = (result as IDataObject).status;
+	return typeof status === 'string' && status.toLowerCase() === 'pending';
+}
+
+/**
+ * A confirmed send (a terminal, non-pending email response, or an SMS send that didn't come
+ * back deliveryUnconfirmed) is already dispatched. Only delivery-unconfirmed SMS outcomes
+ * were being cached before this: if a LATER item in the same batch then threw, n8n's Retry
+ * On Fail or a manual Retry of the whole failed execution reruns every item in this node,
+ * including ones that already sent successfully, and nothing stopped those from being sent
+ * again. Conduyt's SMS route counts a request against its per-user rate limiter BEFORE it
+ * checks the idempotency key, so replaying an already-confirmed prefix on every retry can
+ * spend a fresh rate-limit window on messages that already went out and never reach the one
+ * item that actually still needs to send, retry after retry. Caching the confirmed result
+ * by the same stable send slot as the envelope lets the node skip the network call entirely
+ * for that prefix and go straight to the unsent tail.
+ *
+ * SMS and email expire differently: the SMS operation key Conduyt uses for its own dedupe
+ * is permanent server-side, so an SMS record is stored with `expiresAt: null` and replayed
+ * for the life of the flow context; an email record is stored with an `expiresAt` 24 hours
+ * out, matching Conduyt's own key window, and `now` here (always `Date.now()` from the
+ * caller) is checked against it so a replay past that window is treated as a cache miss and
+ * genuinely resent, exactly as Conduyt's own key handling would now also allow.
  */
 export function confirmedSendOutcome(
 	this: IExecuteFunctions,
 	itemIndex: number,
+	now: number,
 ): IDataObject | undefined {
 	const slot = sendSlot.call(this, itemIndex);
 	const flow = this.getContext('flow');
-	const outcomes = flow[SEND_CONFIRMED_KEY] as Record<string, unknown> | undefined;
-	const stored = outcomes?.[slot];
-	return stored && typeof stored === 'object' && !Array.isArray(stored)
-		? (stored as IDataObject)
-		: undefined;
+	const records = flow[SEND_CONFIRMED_KEY] as Record<string, unknown> | undefined;
+	const record = records?.[slot] as Partial<ConfirmedSendRecord> | undefined;
+	if (!record || typeof record !== 'object' || !record.outcome || typeof record.outcome !== 'object') {
+		return undefined;
+	}
+	if (record.expiresAt !== null && record.expiresAt !== undefined && now >= record.expiresAt) {
+		return undefined;
+	}
+	return record.outcome;
 }
 
 export function storeConfirmedSendOutcome(
 	this: IExecuteFunctions,
 	itemIndex: number,
 	outcome: IDataObject,
+	now: number,
+	ttlMs: number | null,
 ): void {
 	const slot = sendSlot.call(this, itemIndex);
 	const flow = this.getContext('flow');
 	if (!flow[SEND_CONFIRMED_KEY] || typeof flow[SEND_CONFIRMED_KEY] !== 'object') {
 		flow[SEND_CONFIRMED_KEY] = {};
 	}
-	(flow[SEND_CONFIRMED_KEY] as Record<string, unknown>)[slot] = outcome;
+	const record: ConfirmedSendRecord = { outcome, expiresAt: ttlMs === null ? null : now + ttlMs };
+	(flow[SEND_CONFIRMED_KEY] as Record<string, unknown>)[slot] = record;
 }
 
 /** Drop undefined / empty-string keys so PATCH bodies only carry real changes. */
