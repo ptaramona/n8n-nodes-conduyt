@@ -686,6 +686,7 @@ export class Conduyt implements INodeType {
 							// through to a genuine resend below, same as Conduyt's own key handling.
 							result = cachedConfirmed;
 						} else {
+							let statusCode: number | undefined;
 							result = await conduytApiRequest.call(
 								this,
 								'POST',
@@ -699,11 +700,15 @@ export class Conduyt implements INodeType {
 								}),
 								{},
 								{ 'Idempotency-Key': envelope.idempotencyKey },
+								(code) => {
+									statusCode = code;
+								},
 							);
-							// A pending response has not reached a terminal state yet; caching it as
-							// confirmed could skip the email being sent for real. Only cache a terminal
-							// result, and only for 24 hours, matching Conduyt's own email key window.
-							if (!isPendingEmailOutcome(result)) {
+							// A pending response (HTTP 202, a real POST /messages ambiguous-outcome
+							// acceptance) has not reached a terminal state yet; caching it as confirmed
+							// could skip the email being sent for real. Only cache a terminal result,
+							// and only for 24 hours, matching Conduyt's own email key window.
+							if (!isPendingEmailOutcome(result, statusCode)) {
 								storeConfirmedSendOutcome.call(
 									this,
 									i,

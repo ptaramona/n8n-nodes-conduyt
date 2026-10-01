@@ -54,6 +54,10 @@ export async function conduytApiRequest(
 	body: IDataObject = {},
 	qs: IDataObject = {},
 	headers: Record<string, string> = {},
+	// Handed the real HTTP status code of a successful (2xx) response, for a caller that
+	// needs to tell a 202 Accepted apart from a 200 OK (see `isPendingEmailOutcome`): the
+	// return value below stays just the unwrapped body for every other caller, unchanged.
+	onStatus?: (statusCode: number) => void,
 ): Promise<unknown> {
 	const credentials = await this.getCredentials('conduytApi');
 	const baseUrl = ((credentials.baseUrl as string) || 'https://conduyt.app/api/v1').replace(
@@ -67,6 +71,11 @@ export async function conduytApiRequest(
 		qs,
 		body,
 		json: true,
+		// Always requested so the status code is available to pass to `onStatus`; n8n's own
+		// helper still throws on a non-2xx response regardless of this flag, so the catch
+		// block below is unaffected and every existing caller's return value is unaffected too
+		// (still just the unwrapped body).
+		returnFullResponse: true,
 		headers: {
 			Accept: 'application/json',
 			'User-Agent': 'n8n-nodes-conduyt',
@@ -77,12 +86,13 @@ export async function conduytApiRequest(
 	if (Object.keys(qs).length === 0) delete options.qs;
 
 	try {
-		const response = await this.helpers.httpRequestWithAuthentication.call(
+		const response = (await this.helpers.httpRequestWithAuthentication.call(
 			this,
 			'conduytApi',
 			options,
-		);
-		return unwrap(response);
+		)) as { body?: unknown; statusCode?: number };
+		if (onStatus && typeof response?.statusCode === 'number') onStatus(response.statusCode);
+		return unwrap(response?.body);
 	} catch (error) {
 		const err = error as JsonObject & {
 			message?: string;
@@ -441,18 +451,38 @@ interface ConfirmedSendRecord {
 }
 
 /**
- * Conduyt's email send can also answer with a response that has not reached a terminal
- * state yet, such as a 202-style "accepted but not yet resolved" acceptance: the body comes
- * back with `status: 'pending'` instead of a terminal status like `sent` or `queued`.
- * Caching and replaying that locally would wrongly treat the send as already resolved and
- * could skip ever actually dispatching the email; a pending result is therefore never
- * stored, so a later attempt falls through and re-requests it, letting Conduyt's own
- * server-side Idempotency-Key handling resolve it instead of this node guessing.
+ * A message status that means the send has not reached a terminal outcome yet. The actual
+ * POST /messages route (read, read-only, from the server source at
+ * app/api/v1/messages/route.ts on origin/main) answers an ambiguous post-dispatch outcome
+ * with HTTP 202 and a body shaped
+ * `{ ...message fields, status: 'sending', pending: '<explanation>' }`: the pre-dispatch CAS
+ * always moves a row to `sending` before the provider call, and that status is never
+ * overwritten when the outcome comes back ambiguous. `queued` (not yet attempted) and a
+ * literal `pending` are accepted too, in case either is ever returned the same way; none of
+ * these three is a status this node should ever treat as finished.
  */
-export function isPendingEmailOutcome(result: unknown): boolean {
+const PENDING_MESSAGE_STATUSES = new Set(['sending', 'queued', 'pending']);
+
+/**
+ * Conduyt's email send can also answer with a response that has not reached a terminal
+ * state yet: the real contract (see `PENDING_MESSAGE_STATUSES` above) is HTTP 202 with a
+ * body carrying a top-level `pending` field and a message `status` of `sending`. Caching and
+ * replaying that locally would wrongly treat the send as already resolved and could skip
+ * ever actually dispatching the email, so this checks all three independent signals the
+ * route can give (any one is enough): the HTTP status Conduyt actually sent (202), a
+ * top-level `pending` field on the body (checked as an own property, never a response that
+ * merely happens to inherit one), and the message's own `status` being one of the
+ * non-terminal values above. A pending result is never stored, so a later attempt falls
+ * through and re-requests it, letting Conduyt's own server-side Idempotency-Key handling
+ * resolve it instead of this node guessing.
+ */
+export function isPendingEmailOutcome(result: unknown, statusCode?: number): boolean {
+	if (statusCode === 202) return true;
 	if (!result || typeof result !== 'object' || Array.isArray(result)) return false;
-	const status = (result as IDataObject).status;
-	return typeof status === 'string' && status.toLowerCase() === 'pending';
+	const body = result as IDataObject;
+	if (Object.prototype.hasOwnProperty.call(body, 'pending')) return true;
+	const status = body.status;
+	return typeof status === 'string' && PENDING_MESSAGE_STATUSES.has(status.toLowerCase());
 }
 
 /**

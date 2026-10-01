@@ -25,7 +25,15 @@ function execution({ executionId, flow, items = 2, params, send, nodeName = 'Sen
 		helpers: {
 			httpRequestWithAuthentication: async (_credential, options) => {
 				requests.push(options);
-				return send(options, requests.length - 1);
+				const sent = await send(options, requests.length - 1);
+				// conduytApiRequest always sets returnFullResponse and expects { body, statusCode }
+				// back. A mock `send` that already returns that shape (an explicit statusCode, for
+				// a non-200 success like a 202) is passed through as-is; any other mock keeps
+				// returning the bare body it always has, implicitly a 200.
+				if (sent && typeof sent === 'object' && 'statusCode' in sent && 'body' in sent) {
+					return sent;
+				}
+				return { statusCode: 200, body: sent };
 			},
 			returnJsonArray: (data) => data.map((json) => ({ json })),
 			constructExecutionMetaData: (data, { itemData }) =>
@@ -64,6 +72,13 @@ const rateLimited = () => {
 	error.response = { body: { error: 'rate limit exceeded' } };
 	throw error;
 };
+// A terminal (actually sent) email outcome, per the real POST /messages contract: a
+// successful dispatch settles the row to `status: 'sent'` (see `pendingEmail` further down
+// for the ambiguous/202 shape). Distinct from the generic `ok()` above, whose `status:
+// 'queued'` is itself one of the non-terminal statuses `isPendingEmailOutcome` now checks
+// for, on purpose: an email response is never cached as confirmed unless it is genuinely
+// terminal.
+const okEmailSent = () => ({ data: { id: 'msg_1', status: 'sent' } });
 
 test('manual retry replays an already-confirmed item from cache and resends the first evaluation under the same key for the one that actually failed, even when expressions changed', async () => {
 	const node = new Conduyt();
@@ -696,7 +711,7 @@ test('a later item failing does not cause an already-confirmed email send to be 
 		flow,
 		items: 2,
 		params,
-		send: (_options, n) => (n === 0 ? ok() : providerDown()),
+		send: (_options, n) => (n === 0 ? okEmailSent() : providerDown()),
 	});
 	await assert.rejects(() => node.execute.call(first), /provider unavailable/);
 	assert.equal(first.requests.length, 2);
@@ -706,7 +721,7 @@ test('a later item failing does not cause an already-confirmed email send to be 
 		flow,
 		items: 2,
 		params,
-		send: ok,
+		send: okEmailSent,
 	});
 	const out = await node.execute.call(retry);
 	assert.equal(out[0].length, 2);
@@ -738,7 +753,7 @@ test('a confirmed email outcome is replayed within Conduyt\'s 24-hour key window
 	const params = (name) => ({ channel: 'email', contactId: 'con_1', body: 'Hi', subject: 'S' })[name];
 
 	await withFakeNow(0, async () => {
-		const first = execution({ executionId: 'e1', flow, items: 1, params, send: ok });
+		const first = execution({ executionId: 'e1', flow, items: 1, params, send: okEmailSent });
 		await node.execute.call(first);
 		assert.equal(first.requests.length, 1);
 	});
@@ -746,7 +761,7 @@ test('a confirmed email outcome is replayed within Conduyt\'s 24-hour key window
 	// 23 hours later, inside Conduyt's documented 24-hour email key window: replayed from
 	// cache, no request at all.
 	await withFakeNow(23 * 60 * 60 * 1000, async () => {
-		const withinWindow = execution({ executionId: 'e2', flow, items: 1, params, send: ok });
+		const withinWindow = execution({ executionId: 'e2', flow, items: 1, params, send: okEmailSent });
 		const out = await node.execute.call(withinWindow);
 		assert.equal(withinWindow.requests.length, 0);
 		assert.equal(out[0][0].json.id, 'msg_1');
@@ -756,24 +771,40 @@ test('a confirmed email outcome is replayed within Conduyt\'s 24-hour key window
 	// this is a cache miss and the node genuinely resends it, matching what Conduyt's own
 	// server-side key handling would also now allow.
 	await withFakeNow(25 * 60 * 60 * 1000, async () => {
-		const afterWindow = execution({ executionId: 'e3', flow, items: 1, params, send: ok });
+		const afterWindow = execution({ executionId: 'e3', flow, items: 1, params, send: okEmailSent });
 		await node.execute.call(afterWindow);
 		assert.equal(afterWindow.requests.length, 1);
 		assert.equal(afterWindow.requests[0].body.contactId, 'con_1');
 	});
 });
 
-test('a pending email response is never cached, so a retry always re-requests it, even well inside what would be the 24-hour window for a terminal result', async () => {
+// The real POST /messages route (app/api/v1/messages/route.ts on origin/main, confirmed
+// read-only from a separate worktree): when a dispatch comes back ambiguous, it leaves the
+// row at `status: 'sending'` (the pre-dispatch CAS already moved it there, and an ambiguous
+// outcome never overwrites it) and answers `{ ...message fields, pending: '<explanation>' }`
+// at HTTP 202. There is no `status: 'pending'` anywhere in that contract.
+const pendingEmail = () => ({
+	statusCode: 202,
+	body: {
+		data: {
+			id: 'msg_1',
+			status: 'sending',
+			pending: 'Send outcome awaiting provider confirmation — do not resend; check the timeline in a few minutes.',
+		},
+	},
+});
+
+test('a pending email response (the real 202 shape: status sending, a top-level pending field) is never cached, so a retry always re-requests it, even well inside what would be the 24-hour window for a terminal result', async () => {
 	const node = new Conduyt();
 	const flow = {};
 	const params = (name) => ({ channel: 'email', contactId: 'con_1', body: 'Hi', subject: 'S' })[name];
-	const pending = () => ({ data: { id: 'msg_1', status: 'pending' } });
 
 	await withFakeNow(0, async () => {
-		const first = execution({ executionId: 'e1', flow, items: 1, params, send: pending });
+		const first = execution({ executionId: 'e1', flow, items: 1, params, send: pendingEmail });
 		const out = await node.execute.call(first);
 		assert.equal(first.requests.length, 1);
-		assert.equal(out[0][0].json.status, 'pending');
+		assert.equal(out[0][0].json.status, 'sending');
+		assert.match(out[0][0].json.pending, /awaiting provider confirmation/);
 	});
 
 	// Only a minute later: a terminal result would still be well within the 24-hour window,
