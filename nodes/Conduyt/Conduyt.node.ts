@@ -16,9 +16,11 @@ import {
 	clean,
 	conduytApiRequest,
 	conduytApiRequestAllItems,
+	confirmedSendOutcome,
 	deliveryUnconfirmedMessage,
 	sendEnvelope,
 	splitTags,
+	storeConfirmedSendOutcome,
 	storeUnconfirmedSendOutcome,
 	unconfirmedSendOutcome,
 } from './GenericFunctions';
@@ -617,12 +619,22 @@ export class Conduyt implements INodeType {
 						// 0.1.6: outbound SMS goes through the delivery endpoint (provider delivery and
 						// compliance checks run there); POST /messages refuses outbound SMS.
 						const cachedUnconfirmed = unconfirmedSendOutcome.call(this, i);
+						const cachedConfirmed = confirmedSendOutcome.call(this, i);
 						if (cachedUnconfirmed) {
 							// A LATER item threw on a previous attempt, so n8n reran every item in this
 							// node, including this one, which already got a terminal-but-ambiguous result.
 							// Conduyt itself would dispatch a deliveryUnconfirmed row again under the same
 							// key, so replay the stored outcome instead of calling the endpoint again.
 							result = cachedUnconfirmed;
+						} else if (cachedConfirmed) {
+							// Same situation, the common case: this item already sent and got back a
+							// confirmed result, but a LATER item failed, so a retry reruns this one too.
+							// Conduyt's SMS route counts a request against its per-user rate limiter
+							// BEFORE it checks the idempotency key, so resending an already-confirmed
+							// item would spend a fresh rate-limit window on a message that already went
+							// out instead of ever reaching the item that still needs to send. Replay the
+							// stored outcome instead of calling the endpoint again.
+							result = cachedConfirmed;
 						} else {
 							try {
 								result = await conduytApiRequest.call(
@@ -636,6 +648,7 @@ export class Conduyt implements INodeType {
 										idempotencyKey: envelope.idempotencyKey,
 									}),
 								);
+								storeConfirmedSendOutcome.call(this, i, result as IDataObject);
 							} catch (error) {
 								const unconfirmed = deliveryUnconfirmedMessage(error);
 								if (!unconfirmed) throw error;
@@ -657,20 +670,28 @@ export class Conduyt implements INodeType {
 					} else {
 						// Email stays on POST /messages (as in 0.1.5): the API resolves the recipient
 						// from the contact and renders merge fields.
-						result = await conduytApiRequest.call(
-							this,
-							'POST',
-							basePath,
-							clean({
-								contactId: envelope.contactId,
-								channel: envelope.channel,
-								direction: 'outbound',
-								subject: envelope.subject,
-								body: envelope.body,
-							}),
-							{},
-							{ 'Idempotency-Key': envelope.idempotencyKey },
-						);
+						const cachedConfirmed = confirmedSendOutcome.call(this, i);
+						if (cachedConfirmed) {
+							// Same mechanism as the SMS branch above: a later item's failure in the same
+							// batch must not resend an email that already went out on a retry.
+							result = cachedConfirmed;
+						} else {
+							result = await conduytApiRequest.call(
+								this,
+								'POST',
+								basePath,
+								clean({
+									contactId: envelope.contactId,
+									channel: envelope.channel,
+									direction: 'outbound',
+									subject: envelope.subject,
+									body: envelope.body,
+								}),
+								{},
+								{ 'Idempotency-Key': envelope.idempotencyKey },
+							);
+							storeConfirmedSendOutcome.call(this, i, result as IDataObject);
+						}
 					}
 				} else if (resource === 'tag' && operation === 'create') {
 					result = await conduytApiRequest.call(this, 'POST', basePath, {

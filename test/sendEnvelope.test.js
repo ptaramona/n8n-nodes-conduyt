@@ -59,8 +59,13 @@ const deliveryUnconfirmed = () => {
 	};
 	throw error;
 };
+const rateLimited = () => {
+	const error = new Error('429 Too Many Requests');
+	error.response = { body: { error: 'rate limit exceeded' } };
+	throw error;
+};
 
-test('manual retry resends the first evaluation under the same key, even when expressions changed', async () => {
+test('manual retry replays an already-confirmed item from cache and resends the first evaluation under the same key for the one that actually failed, even when expressions changed', async () => {
 	const node = new Conduyt();
 	const flow = {};
 
@@ -104,19 +109,18 @@ test('manual retry resends the first evaluation under the same key, even when ex
 	});
 	const out = await node.execute.call(retry);
 	assert.equal(out[0].length, 2);
-	assert.equal(retry.requests.length, 2);
-
-	// The already-sent item goes back to the SAME endpoint with the SAME request and key,
-	// so Conduyt answers it from the first send instead of sending again or conflicting.
-	assert.deepEqual(retry.requests[0], sentSms);
-	assert.equal(retry.requests[0].url, 'https://conduyt.test/api/v1/messages/sms/send');
-	assert.equal(retry.requests[0].body.body, 'Hello from run 1 item 0');
+	// Item 0 already sent and was confirmed, so the retry replays the cached result and
+	// never calls the endpoint for it again; only the item that actually failed (item 1)
+	// makes a new request.
+	assert.equal(retry.requests.length, 1);
+	assert.equal(out[0][0].json.id, 'msg_1');
+	assert.equal(out[0][0].json.status, 'queued');
 
 	// The failed item is retried as first evaluated, under its original key.
-	assert.deepEqual(retry.requests[1], failedEmail);
-	assert.equal(retry.requests[1].body.body, 'Hello from run 1 item 1');
-	assert.equal(retry.requests[1].body.subject, 'Run 1 subject');
-	assert.equal(retry.requests[1].headers['Idempotency-Key'], failedEmail.headers['Idempotency-Key']);
+	assert.deepEqual(retry.requests[0], failedEmail);
+	assert.equal(retry.requests[0].body.body, 'Hello from run 1 item 1');
+	assert.equal(retry.requests[0].body.subject, 'Run 1 subject');
+	assert.equal(retry.requests[0].headers['Idempotency-Key'], failedEmail.headers['Idempotency-Key']);
 });
 
 test('a fresh execution evaluates anew: the changed channel really switches endpoints', async () => {
@@ -166,7 +170,7 @@ test('a caller-supplied idempotency key is sent verbatim for SMS and email', asy
 	assert.equal(email.requests[0].headers['Idempotency-Key'], 'order-43');
 });
 
-test('ordinary retry (flow context carried over): a caller key reuses the stored envelope, same as the generated path', async () => {
+test('ordinary retry (flow context carried over): an already-confirmed caller-key item replays from cache instead of resending, even though the envelope would also reuse the same request', async () => {
 	const node = new Conduyt();
 	const flow = {};
 
@@ -185,10 +189,13 @@ test('ordinary retry (flow context carried over): a caller key reuses the stored
 		send: ok,
 	});
 	await node.execute.call(first);
+	assert.equal(first.requests.length, 1);
+	assert.equal(first.requests[0].body.idempotencyKey, 'order-0001');
 
 	// Retry On Fail / manual Retry with the SAME saved flow object, expressions re-evaluated
-	// to a different body. The slot (node + run index + item index) is unchanged, so the
-	// cached envelope is reused rather than resent with the changed body.
+	// to a different body. The slot (node + run index + item index) is unchanged and this item
+	// already reached a confirmed outcome, so the retry replays the cached result and makes no
+	// request at all, with no network call to reuse the (also unchanged) cached envelope on.
 	const retry = execution({
 		executionId: 'e2',
 		flow,
@@ -203,11 +210,11 @@ test('ordinary retry (flow context carried over): a caller key reuses the stored
 			})[name],
 		send: ok,
 	});
-	await node.execute.call(retry);
+	const out = await node.execute.call(retry);
 
-	assert.deepEqual(retry.requests[0], first.requests[0]);
-	assert.equal(retry.requests[0].body.idempotencyKey, 'order-0001');
-	assert.equal(retry.requests[0].body.body, 'Hello from run 1');
+	assert.equal(retry.requests.length, 0);
+	assert.equal(out[0][0].json.id, 'msg_1');
+	assert.equal(out[0][0].json.status, 'queued');
 });
 
 test('crash recovery (fresh flow state): the caller key stays stable on its own, but the snapshot does not survive, only the key does', async () => {
@@ -564,6 +571,73 @@ test('documents the limit: a worker crash before n8n saves the run loses the unc
 	assert.equal(out2[0][0].json.deliveryUnconfirmed, undefined);
 });
 
+test('a later item hitting the rate limit does not cause already-confirmed SMS sends to be replayed on retry (limit-plus-one livelock)', async () => {
+	const node = new Conduyt();
+	const flow = {};
+	const params = (name, i) =>
+		({ channel: 'sms', contactId: `con_${i}`, body: `Body ${i}`, fromNumber: '+15550001111' })[name];
+
+	// First attempt: items 0 and 1 are confirmed sends; item 2 hits Conduyt's per-user
+	// rate limiter (429) before the endpoint even reaches the idempotency check, which
+	// fails the whole node.
+	const first = execution({
+		executionId: 'e1',
+		flow,
+		items: 3,
+		params,
+		send: (_options, n) => (n < 2 ? ok() : rateLimited()),
+	});
+	await assert.rejects(() => node.execute.call(first), /rate limit/);
+	assert.equal(first.requests.length, 3);
+
+	// Manual Retry of the whole failed execution: n8n reruns every item in this node. If
+	// items 0 and 1 (already confirmed) were resent, each would spend a fresh rate-limit
+	// window on a message that already went out, and item 2 would never get a turn: a
+	// livelock. The confirmed prefix must be replayed from cache, not resent.
+	const retry = execution({
+		executionId: 'e2',
+		flow,
+		items: 3,
+		params,
+		send: ok,
+	});
+	const out = await node.execute.call(retry);
+	assert.equal(out[0].length, 3);
+	// Only item 2 (the one that never got a confirmed result) makes a new request.
+	assert.equal(retry.requests.length, 1);
+	assert.equal(retry.requests[0].body.contactId, 'con_2');
+});
+
+test('a later item failing does not cause an already-confirmed email send to be replayed on retry', async () => {
+	const node = new Conduyt();
+	const flow = {};
+	const params = (name, i) =>
+		({ channel: 'email', contactId: `con_${i}`, body: `Body ${i}`, subject: 'S' })[name];
+
+	const first = execution({
+		executionId: 'e1',
+		flow,
+		items: 2,
+		params,
+		send: (_options, n) => (n === 0 ? ok() : providerDown()),
+	});
+	await assert.rejects(() => node.execute.call(first), /provider unavailable/);
+	assert.equal(first.requests.length, 2);
+
+	const retry = execution({
+		executionId: 'e2',
+		flow,
+		items: 2,
+		params,
+		send: ok,
+	});
+	const out = await node.execute.call(retry);
+	assert.equal(out[0].length, 2);
+	// Only item 1 (the one that actually failed) makes a new request.
+	assert.equal(retry.requests.length, 1);
+	assert.equal(retry.requests[0].body.contactId, 'con_1');
+});
+
 test('a whitespace-only caller key is rejected for SMS and email, not silently treated as unset', async () => {
 	const node = new Conduyt();
 	const sms = execution({
@@ -623,6 +697,73 @@ test('a numeric caller key (an upstream ID that stayed a number) is coerced to i
 	});
 	await node.execute.call(email);
 	assert.equal(email.requests[0].headers['Idempotency-Key'], '42');
+});
+
+test('an unsafe integer caller key (precision already lost) is rejected rather than silently collapsed with a neighboring ID', async () => {
+	const node = new Conduyt();
+	// 9007199254740992 and 9007199254740993 are both unsafe and round to the SAME Number,
+	// so accepting either as a key would make two distinct upstream IDs collide.
+	const sms = execution({
+		executionId: 'e1',
+		flow: {},
+		items: 1,
+		params: (name) =>
+			({
+				channel: 'sms',
+				contactId: 'con_1',
+				body: 'Hi',
+				fromNumber: '+15550001111',
+				idempotencyKey: 9007199254740993,
+			})[name],
+		send: ok,
+	});
+	await assert.rejects(() => node.execute.call(sms), /safe integer/);
+	assert.equal(sms.requests.length, 0);
+
+	const email = execution({
+		executionId: 'e2',
+		flow: {},
+		items: 1,
+		params: (name) =>
+			({ channel: 'email', contactId: 'con_1', body: 'Hi', subject: 'S', idempotencyKey: 9007199254740992 })[
+				name
+			],
+		send: ok,
+	});
+	await assert.rejects(() => node.execute.call(email), /safe integer/);
+	assert.equal(email.requests.length, 0);
+});
+
+test('NaN and +/-Infinity caller keys are rejected, not turned into reusable literal keys', async () => {
+	const node = new Conduyt();
+	for (const bad of [NaN, Infinity, -Infinity]) {
+		const sms = execution({
+			executionId: `e-${bad}`,
+			flow: {},
+			items: 1,
+			params: (name) =>
+				({ channel: 'sms', contactId: 'con_1', body: 'Hi', fromNumber: '+15550001111', idempotencyKey: bad })[
+					name
+				],
+			send: ok,
+		});
+		await assert.rejects(() => node.execute.call(sms), /safe integer/);
+		assert.equal(sms.requests.length, 0);
+	}
+});
+
+test('a negative-zero caller key is rejected, not treated as the same key as a literal 0', async () => {
+	const node = new Conduyt();
+	const sms = execution({
+		executionId: 'e1',
+		flow: {},
+		items: 1,
+		params: (name) =>
+			({ channel: 'sms', contactId: 'con_1', body: 'Hi', fromNumber: '+15550001111', idempotencyKey: -0 })[name],
+		send: ok,
+	});
+	await assert.rejects(() => node.execute.call(sms), /safe integer, got -0/);
+	assert.equal(sms.requests.length, 0);
 });
 
 test('a null caller key (an upstream expression that resolved to no value) is treated as unset, for SMS and email', async () => {

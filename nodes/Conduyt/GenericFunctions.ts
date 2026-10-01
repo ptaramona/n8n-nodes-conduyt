@@ -245,11 +245,30 @@ function sendSlot(this: IExecuteFunctions, itemIndex: number): string {
  * undefined, null, and the exact empty string all mean "not supplied"; anything else that
  * is not a string or number (an object, a boolean, an array) is a mistake worth a clear
  * error here, not a `callerKey.trim is not a function` further down.
+ *
+ * A number is only accepted when `Number.isSafeInteger`, and never as `-0`: every other
+ * JS number loses the precision an idempotency key needs to stay distinct. A 64-bit
+ * upstream ID like 9007199254740992 and 9007199254740993 both round to the same unsafe
+ * Number and so to the same key; NaN and +/-Infinity are reusable literals that would
+ * silently become shared keys across unrelated items; -0 stringifies to '0', the exact
+ * same key as a literal 0. A bigint is exact regardless of size and is accepted as-is;
+ * an upstream ID too large to stay a safe Number should be passed as a string or bigint.
  */
 function normalizeCallerKey(node: INode, raw: unknown, itemIndex: number): string | undefined {
 	if (raw === undefined || raw === null || raw === '') return undefined;
 	if (typeof raw === 'string') return raw;
-	if (typeof raw === 'number' || typeof raw === 'bigint') return String(raw);
+	if (typeof raw === 'bigint') return String(raw);
+	if (typeof raw === 'number') {
+		if (!Number.isSafeInteger(raw) || Object.is(raw, -0)) {
+			const shown = Object.is(raw, -0) ? '-0' : String(raw);
+			throw new NodeOperationError(
+				node,
+				`Idempotency Key must be a finite safe integer, got ${shown}; pass larger IDs as a string`,
+				{ itemIndex },
+			);
+		}
+		return String(raw);
+	}
 	throw new NodeOperationError(
 		node,
 		`Idempotency Key must be a string or number, got ${typeof raw}`,
@@ -393,6 +412,48 @@ export function storeUnconfirmedSendOutcome(
 		flow[SEND_UNCONFIRMED_KEY] = {};
 	}
 	(flow[SEND_UNCONFIRMED_KEY] as Record<string, unknown>)[slot] = outcome;
+}
+
+/** Flow-context key under which a terminal, confirmed send outcome is kept, by slot. */
+const SEND_CONFIRMED_KEY = 'conduytSendConfirmed';
+
+/**
+ * A confirmed send (any email send that didn't throw, or an SMS send that didn't come back
+ * deliveryUnconfirmed) is terminal and already dispatched. Only delivery-unconfirmed SMS
+ * outcomes were being cached before this: if a LATER item in the same batch then threw,
+ * n8n's Retry On Fail or a manual Retry of the whole failed execution reruns every item in
+ * this node, including ones that already sent successfully, and nothing stopped those from
+ * being sent again. Conduyt's SMS route counts a request against its per-user rate limiter
+ * BEFORE it checks the idempotency key, so replaying an already-confirmed prefix on every
+ * retry can spend a fresh rate-limit window on messages that already went out and never
+ * reach the one item that actually still needs to send, retry after retry. Caching the
+ * confirmed result by the same stable send slot as the envelope lets the node skip the
+ * network call entirely for that prefix and go straight to the unsent tail.
+ */
+export function confirmedSendOutcome(
+	this: IExecuteFunctions,
+	itemIndex: number,
+): IDataObject | undefined {
+	const slot = sendSlot.call(this, itemIndex);
+	const flow = this.getContext('flow');
+	const outcomes = flow[SEND_CONFIRMED_KEY] as Record<string, unknown> | undefined;
+	const stored = outcomes?.[slot];
+	return stored && typeof stored === 'object' && !Array.isArray(stored)
+		? (stored as IDataObject)
+		: undefined;
+}
+
+export function storeConfirmedSendOutcome(
+	this: IExecuteFunctions,
+	itemIndex: number,
+	outcome: IDataObject,
+): void {
+	const slot = sendSlot.call(this, itemIndex);
+	const flow = this.getContext('flow');
+	if (!flow[SEND_CONFIRMED_KEY] || typeof flow[SEND_CONFIRMED_KEY] !== 'object') {
+		flow[SEND_CONFIRMED_KEY] = {};
+	}
+	(flow[SEND_CONFIRMED_KEY] as Record<string, unknown>)[slot] = outcome;
 }
 
 /** Drop undefined / empty-string keys so PATCH bodies only carry real changes. */
