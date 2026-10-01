@@ -78,11 +78,37 @@ export async function conduytApiRequest(
 			(typeof responseBody.error === 'string' && responseBody.error) ||
 			(typeof responseBody.message === 'string' && responseBody.message) ||
 			undefined;
-		throw new NodeApiError(this.getNode(), err, {
+		const apiError = new NodeApiError(this.getNode(), err, {
 			message: apiMessage ? `Conduyt API: ${apiMessage}` : undefined,
 			description: apiMessage ?? err.message,
 		});
+		// Carries the parsed body forward so a caller can inspect it (see
+		// `deliveryUnconfirmedMessage`) without re-deriving it from the raw error shape.
+		(apiError as NodeApiError & { conduytResponseBody?: JsonObject }).conduytResponseBody =
+			responseBody;
+		throw apiError;
 	}
+}
+
+/**
+ * Conduyt answers an SMS dispatch it could not confirm the provider accepted with a 422
+ * whose Message carries `metadata.deliveryUnconfirmed: true`; the message may already be at
+ * the recipient, and Conduyt's own idempotency store treats that row as free to dispatch
+ * again under the same key. Returns the unwrapped Message when `error` carries that shape,
+ * so the caller can report it on the item instead of throwing: n8n retries any thrown node
+ * error when Retry On Fail is on, and throwing here risks the exact double-send this node
+ * exists to prevent.
+ */
+export function deliveryUnconfirmedMessage(error: unknown): IDataObject | undefined {
+	const body = (error as { conduytResponseBody?: JsonObject } | null)?.conduytResponseBody;
+	if (!body) return undefined;
+	const message = unwrap(body);
+	if (!message || typeof message !== 'object' || Array.isArray(message)) return undefined;
+	const metadata = (message as IDataObject).metadata;
+	if (!metadata || typeof metadata !== 'object' || (metadata as IDataObject).deliveryUnconfirmed !== true) {
+		return undefined;
+	}
+	return message as IDataObject;
 }
 
 /**
@@ -223,7 +249,10 @@ function assertCallerKeyLength(node: INode, channel: string, key: string, itemIn
  * snapshot is lost in the same crash, the payload is re-evaluated from scratch, so the
  * same caller key must always come with the same item data (channel, contact, body) or a
  * crash-triggered retry can send a different payload under the matching key. A caller key
- * already owned by a different send slot is rejected rather than reused.
+ * already owned by a different send slot is rejected rather than reused, and so is one
+ * with leading or trailing whitespace: the email endpoint canonicalizes the header with
+ * `trim()` before using it as the server-side dedupe key, so " x" and "x" would pass this
+ * function's own (unvarnished) collision check yet collide on the wire.
  */
 export function sendEnvelope(
 	this: IExecuteFunctions,
@@ -241,6 +270,13 @@ export function sendEnvelope(
 	if (isSendEnvelope(stored)) return stored;
 
 	const hasCallerKey = callerKey.trim() !== '';
+	if (hasCallerKey && callerKey !== callerKey.trim()) {
+		throw new NodeOperationError(
+			this.getNode(),
+			'Idempotency Key must not have leading or trailing whitespace',
+			{ itemIndex },
+		);
+	}
 	const fields = evaluate();
 	const idempotencyKey = hasCallerKey ? callerKey : sendIdempotencyKey.call(this, itemIndex);
 

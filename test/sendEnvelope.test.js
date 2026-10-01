@@ -10,7 +10,7 @@ const { Conduyt } = require('../dist/nodes/Conduyt/Conduyt.node');
  * plays the expression evaluator: a manual retry re-evaluates $now, $execution.id and
  * the like, so the retry gets a different `params`.
  */
-function execution({ executionId, flow, items = 2, params, send, nodeName = 'Send' }) {
+function execution({ executionId, flow, items = 2, params, send, nodeName = 'Send', continueOnFail = false }) {
 	const requests = [];
 	return {
 		requests,
@@ -31,7 +31,7 @@ function execution({ executionId, flow, items = 2, params, send, nodeName = 'Sen
 			constructExecutionMetaData: (data, { itemData }) =>
 				data.map((entry) => ({ ...entry, pairedItem: itemData })),
 		},
-		continueOnFail: () => false,
+		continueOnFail: () => continueOnFail,
 		getNode: () => ({ name: nodeName, type: 'n8n-nodes-conduyt.conduyt', typeVersion: 1, position: [0, 0], parameters: {} }),
 		getWorkflow: () => ({ id: 'wf-1' }),
 		getExecutionId: () => executionId,
@@ -47,6 +47,16 @@ const ok = () => ({ data: { id: 'msg_1', status: 'queued' } });
 const providerDown = () => {
 	const error = new Error('502 Bad Gateway');
 	error.response = { body: { error: 'provider unavailable' } };
+	throw error;
+};
+const deliveryUnconfirmed = () => {
+	const error = new Error('422 Unprocessable Entity');
+	error.response = {
+		body: {
+			error: 'Delivery could not be confirmed',
+			data: { id: 'msg_1', status: 'sent', metadata: { deliveryUnconfirmed: true } },
+		},
+	};
 	throw error;
 };
 
@@ -408,4 +418,68 @@ test('the snapshot survives a JSON round trip of the saved run data', async () =
 	});
 	await node.execute.call(retry);
 	assert.deepEqual(retry.requests[0], first.requests[0]);
+});
+
+test('an unconfirmed SMS delivery is reported on the item, not thrown, so Retry On Fail never fires a second request', async () => {
+	const node = new Conduyt();
+	const ctx = execution({
+		executionId: 'e1',
+		flow: {},
+		items: 1,
+		params: (name) =>
+			({ channel: 'sms', contactId: 'con_1', body: 'Hi', fromNumber: '+15550001111' })[name],
+		send: deliveryUnconfirmed,
+	});
+
+	// A single call to execute() is the node's one and only attempt. Because it resolves
+	// instead of rejecting, n8n's Retry On Fail (which only fires on a thrown error) has
+	// nothing to retry: this assertion on requests.length is the two-attempt contract,
+	// there is no second attempt to make a second request from.
+	const out = await node.execute.call(ctx);
+	assert.equal(ctx.requests.length, 1);
+	assert.equal(out[0][0].json.deliveryUnconfirmed, true);
+	assert.match(out[0][0].json.warning, /may already have delivered/);
+	assert.equal(out[0][0].json.id, 'msg_1');
+});
+
+test('an unconfirmed SMS delivery is reported the same way whether continueOnFail is on or off', async () => {
+	const node = new Conduyt();
+	const withContinueOnFail = execution({
+		executionId: 'e1',
+		flow: {},
+		items: 1,
+		continueOnFail: true,
+		params: (name) =>
+			({ channel: 'sms', contactId: 'con_1', body: 'Hi', fromNumber: '+15550001111' })[name],
+		send: deliveryUnconfirmed,
+	});
+	const out = await node.execute.call(withContinueOnFail);
+	assert.equal(withContinueOnFail.requests.length, 1);
+	// Not the continueOnFail error-item shape ({ json: { error } }): a real, successful item.
+	assert.equal(out[0][0].json.error, undefined);
+	assert.equal(out[0][0].json.deliveryUnconfirmed, true);
+});
+
+test('whitespace-equivalent caller keys for email are rejected, not silently collided on the server', async () => {
+	const node = new Conduyt();
+	const ctx = execution({
+		executionId: 'e1',
+		flow: {},
+		items: 2,
+		params: (name, i) =>
+			({
+				channel: 'email',
+				contactId: `con_${i}`,
+				body: `Body for item ${i}`,
+				subject: 'S',
+				// The email endpoint trims the header server-side, so these two are the same
+				// wire key even though they differ in this function's own raw comparison.
+				idempotencyKey: i === 0 ? 'order-42' : ' order-42',
+			})[name],
+		send: ok,
+	});
+
+	await assert.rejects(() => node.execute.call(ctx), /leading or trailing whitespace/);
+	assert.equal(ctx.requests.length, 1);
+	assert.equal(ctx.requests[0].headers['Idempotency-Key'], 'order-42');
 });

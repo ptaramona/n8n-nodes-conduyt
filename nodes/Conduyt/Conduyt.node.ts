@@ -16,6 +16,7 @@ import {
 	clean,
 	conduytApiRequest,
 	conduytApiRequestAllItems,
+	deliveryUnconfirmedMessage,
 	sendEnvelope,
 	splitTags,
 } from './GenericFunctions';
@@ -430,7 +431,7 @@ export class Conduyt implements INodeType {
 			},
 			{
 				displayName:
-					'Each item is sent with its own idempotency key, so Retry On Fail and a manual Retry of a failed execution never send the same message twice. For SMS the key stays with the message. For email Conduyt keeps the key for 24 hours: a retry within 24 hours never sends twice, a retry after 24 hours sends the email again. Set Idempotency Key below to supply your own key from the upstream item instead: the key itself survives a worker crash between Conduyt accepting the request and n8n saving the run, but the saved request snapshot does not, so give the same key the same item data every time. Each key must belong to one item; reusing it for a different item or node is rejected.',
+					'Each item is sent with its own idempotency key, so Retry On Fail and a manual Retry of a failed execution do not resend a request Conduyt already confirmed. An SMS whose delivery Conduyt could not confirm is reported on the item instead, flagged deliveryUnconfirmed, and is never retried by this node; you decide whether to send it again. For email Conduyt keeps the key for 24 hours: a retry within 24 hours never sends twice, a retry after 24 hours sends the email again. Set Idempotency Key below to supply your own key from the upstream item instead: the key itself survives a worker crash between Conduyt accepting the request and n8n saving the run, but the saved request snapshot does not, so give the same key the same item data every time. Each key must belong to one item, with no leading or trailing whitespace; reusing it for a different item or node is rejected.',
 				name: 'sendRetryNotice',
 				type: 'notice',
 				default: '',
@@ -487,7 +488,7 @@ export class Conduyt implements INodeType {
 				type: 'string',
 				default: '',
 				description:
-					'Map a unique ID from the upstream item, such as the record or event ID, sent exactly as given (SMS: 8 to 200 characters; email: up to 255). The key stays stable across any retry, including one after a worker crash, but the saved snapshot of the request does not survive that crash, only the key does, so the same key must always come with the same item data. Reusing a key for a different item or node is rejected. Left empty, the node generates a key that holds, snapshot included, for retries of the same execution, but a worker crash between Conduyt accepting the request and n8n saving the run can send it again.',
+					'Map a unique ID from the upstream item, such as the record or event ID, sent exactly as given (SMS: 8 to 200 characters; email: up to 255). The key stays stable across any retry, including one after a worker crash, but the saved snapshot of the request does not survive that crash, only the key does, so the same key must always come with the same item data. Reusing a key for a different item or node is rejected, and so is one with leading or trailing whitespace. Left empty, the node generates a key that holds, snapshot included, for retries of the same execution, but a worker crash between Conduyt accepting the request and n8n saving the run can send it again.',
 				displayOptions: show('message', 'send'),
 			},
 
@@ -613,17 +614,33 @@ export class Conduyt implements INodeType {
 					if (envelope.channel === 'sms') {
 						// 0.1.6: outbound SMS goes through the delivery endpoint (provider delivery and
 						// compliance checks run there); POST /messages refuses outbound SMS.
-						result = await conduytApiRequest.call(
-							this,
-							'POST',
-							'/messages/sms/send',
-							clean({
-								contactId: envelope.contactId,
-								body: envelope.body,
-								fromNumber: envelope.fromNumber,
-								idempotencyKey: envelope.idempotencyKey,
-							}),
-						);
+						try {
+							result = await conduytApiRequest.call(
+								this,
+								'POST',
+								'/messages/sms/send',
+								clean({
+									contactId: envelope.contactId,
+									body: envelope.body,
+									fromNumber: envelope.fromNumber,
+									idempotencyKey: envelope.idempotencyKey,
+								}),
+							);
+						} catch (error) {
+							const unconfirmed = deliveryUnconfirmedMessage(error);
+							if (!unconfirmed) throw error;
+							// Conduyt treats a same-key deliveryUnconfirmed row as free to dispatch again, and
+							// n8n retries any thrown node error when Retry On Fail is on, so throwing here
+							// risks the exact double-send this node exists to prevent. Report it on the item
+							// instead, success or not: the node never retries an unconfirmed send on its own,
+							// the user decides whether to send it again.
+							result = {
+								...unconfirmed,
+								deliveryUnconfirmed: true,
+								warning:
+									'Conduyt could not confirm this SMS reached the recipient; the provider may already have delivered it. This node does not retry an unconfirmed send automatically, check delivery before sending again.',
+							};
+						}
 					} else {
 						// Email stays on POST /messages (as in 0.1.5): the API resolves the recipient
 						// from the contact and renders merge fields.
