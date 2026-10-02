@@ -16,7 +16,15 @@ import {
 	clean,
 	conduytApiRequest,
 	conduytApiRequestAllItems,
+	confirmedSendOutcome,
+	deliveryUnconfirmedMessage,
+	EMAIL_CONFIRMED_SEND_TTL_MS,
+	isPendingEmailOutcome,
+	sendEnvelope,
 	splitTags,
+	storeConfirmedSendOutcome,
+	storeUnconfirmedSendOutcome,
+	unconfirmedSendOutcome,
 } from './GenericFunctions';
 
 const RESOURCES = [
@@ -428,6 +436,14 @@ export class Conduyt implements INodeType {
 				default: 'send',
 			},
 			{
+				displayName:
+					'Each item is sent with its own idempotency key, so Retry On Fail and a manual Retry of a failed execution do not resend a request Conduyt already confirmed. An SMS whose delivery Conduyt could not confirm is reported on the item instead, flagged deliveryUnconfirmed, and is never retried by this node within the same saved run; you decide whether to send it again. That protection lives in the run n8n saves after the report: a worker crash before n8n saves it loses the record, and Conduyt still allows another dispatch under the same key, so a retry after such a crash can resend it; check the conversation before retrying when you cannot rule that out. For email Conduyt keeps the key for 24 hours: a retry within 24 hours never sends twice, a retry after 24 hours sends the email again. Set Idempotency Key below to supply your own key from the upstream item instead: the key itself survives a worker crash between Conduyt accepting the request and n8n saving the run, but the saved request snapshot does not, so give the same key the same item data every time. Each key must belong to one item, with no leading or trailing whitespace; reusing it for a different item or node is rejected.',
+				name: 'sendRetryNotice',
+				type: 'notice',
+				default: '',
+				displayOptions: show('message', 'send'),
+			},
+			{
 				displayName: 'Contact ID',
 				name: 'contactId',
 				type: 'string',
@@ -454,12 +470,31 @@ export class Conduyt implements INodeType {
 				displayOptions: { show: { resource: ['message'], operation: ['send'], channel: ['email'] } },
 			},
 			{
+				displayName: 'From Number',
+				name: 'fromNumber',
+				type: 'string',
+				placeholder: '+15555550123',
+				default: '',
+				description:
+					"The number to send from: the account's number or an assigned agent line (DID). Leave empty to use the sending user's assigned line when they have one, otherwise the account number.",
+				displayOptions: { show: { resource: ['message'], operation: ['send'], channel: ['sms'] } },
+			},
+			{
 				displayName: 'Body',
 				name: 'body',
 				type: 'string',
 				typeOptions: { rows: 4 },
 				default: '',
 				required: true,
+				displayOptions: show('message', 'send'),
+			},
+			{
+				displayName: 'Idempotency Key',
+				name: 'idempotencyKey',
+				type: 'string',
+				default: '',
+				description:
+					'Map a unique ID from the upstream item, such as the record or event ID, sent exactly as given (SMS: 8 to 200 characters; email: up to 255). The key stays stable across any retry, including one after a worker crash, but the saved snapshot of the request does not survive that crash, only the key does, so the same key must always come with the same item data. A stable key does not cover an SMS reported deliveryUnconfirmed: Conduyt still allows another dispatch under the same key, so a worker crash before n8n saves the run can resend it on retry regardless of whether the key is generated or supplied here. Reusing a key for a different item or node is rejected, and so is one with leading or trailing whitespace. Left empty, the node generates a key that holds, snapshot included, for retries of the same execution, but a worker crash between Conduyt accepting the request and n8n saving the run can send it again.',
 				displayOptions: show('message', 'send'),
 			},
 
@@ -567,15 +602,123 @@ export class Conduyt implements INodeType {
 					}
 					result = await conduytApiRequest.call(this, 'POST', basePath, body);
 				} else if (resource === 'message' && operation === 'send') {
-					const channel = this.getNodeParameter('channel', i) as string;
-					const body = clean({
-						contactId: this.getNodeParameter('contactId', i) as string,
-						channel,
-						direction: 'outbound',
-						subject: channel === 'email' ? (this.getNodeParameter('subject', i) as string) : undefined,
-						body: this.getNodeParameter('body', i) as string,
-					});
-					result = await conduytApiRequest.call(this, 'POST', basePath, body);
+					// Both paths carry a per-item idempotency key so a retry never double-sends. The
+					// key and the evaluated request travel together: a retry reuses the snapshot
+					// instead of re-evaluating expressions next to a reused key.
+					const envelope = sendEnvelope.call(
+						this,
+						i,
+						this.getNodeParameter('idempotencyKey', i, ''),
+						() => ({
+							channel: this.getNodeParameter('channel', i) as string,
+							contactId: this.getNodeParameter('contactId', i) as string,
+							body: this.getNodeParameter('body', i) as string,
+							subject: this.getNodeParameter('subject', i, '') as string,
+							fromNumber: this.getNodeParameter('fromNumber', i, '') as string,
+						}),
+					);
+					// Captured once per item so a lookup and a store in the same attempt agree on
+					// "now"; see `confirmedSendOutcome` for why SMS and email expire differently.
+					const now = Date.now();
+					if (envelope.channel === 'sms') {
+						// 0.1.6: outbound SMS goes through the delivery endpoint (provider delivery and
+						// compliance checks run there); POST /messages refuses outbound SMS.
+						const cachedUnconfirmed = unconfirmedSendOutcome.call(this, i);
+						const cachedConfirmed = confirmedSendOutcome.call(this, i, now);
+						if (cachedUnconfirmed) {
+							// A LATER item threw on a previous attempt, so n8n reran every item in this
+							// node, including this one, which already got a terminal-but-ambiguous result.
+							// Conduyt itself would dispatch a deliveryUnconfirmed row again under the same
+							// key, so replay the stored outcome instead of calling the endpoint again.
+							result = cachedUnconfirmed;
+						} else if (cachedConfirmed) {
+							// Same situation, the common case: this item already sent and got back a
+							// confirmed result, but a LATER item failed, so a retry reruns this one too.
+							// Conduyt's SMS route counts a request against its per-user rate limiter
+							// BEFORE it checks the idempotency key, so resending an already-confirmed
+							// item would spend a fresh rate-limit window on a message that already went
+							// out instead of ever reaching the item that still needs to send. Replay the
+							// stored outcome instead of calling the endpoint again.
+							result = cachedConfirmed;
+						} else {
+							try {
+								result = await conduytApiRequest.call(
+									this,
+									'POST',
+									'/messages/sms/send',
+									clean({
+										contactId: envelope.contactId,
+										body: envelope.body,
+										fromNumber: envelope.fromNumber,
+										idempotencyKey: envelope.idempotencyKey,
+									}),
+								);
+								// SMS has no pending/terminal split and no expiry: Conduyt's own operation
+								// key for this route is permanent server-side, so the cache never expires.
+								storeConfirmedSendOutcome.call(this, i, result as IDataObject, now, null);
+							} catch (error) {
+								const unconfirmed = deliveryUnconfirmedMessage(error);
+								if (!unconfirmed) throw error;
+								// Conduyt treats a same-key deliveryUnconfirmed row as free to dispatch again,
+								// and n8n retries any thrown node error when Retry On Fail is on, so throwing
+								// here risks the exact double-send this node exists to prevent. Report it on
+								// the item instead, success or not: the node never retries an unconfirmed send
+								// on its own, the user decides whether to send it again. Cached by slot so a
+								// later item's failure can't cause this one to be sent again on retry.
+								result = {
+									...unconfirmed,
+									deliveryUnconfirmed: true,
+									warning:
+										'Conduyt could not confirm this SMS reached the recipient; the provider may already have delivered it. This node does not retry an unconfirmed send automatically, check delivery before sending again.',
+								};
+								storeUnconfirmedSendOutcome.call(this, i, result as IDataObject);
+							}
+						}
+					} else {
+						// Email stays on POST /messages (as in 0.1.5): the API resolves the recipient
+						// from the contact and renders merge fields.
+						const cachedConfirmed = confirmedSendOutcome.call(this, i, now);
+						if (cachedConfirmed) {
+							// Same mechanism as the SMS branch above: a later item's failure in the same
+							// batch must not resend an email that already went out on a retry, as long as
+							// Conduyt's own 24-hour key window for this send has not yet closed (checked
+							// inside confirmedSendOutcome); past it, this is a cache miss and falls
+							// through to a genuine resend below, same as Conduyt's own key handling.
+							result = cachedConfirmed;
+						} else {
+							let statusCode: number | undefined;
+							result = await conduytApiRequest.call(
+								this,
+								'POST',
+								basePath,
+								clean({
+									contactId: envelope.contactId,
+									channel: envelope.channel,
+									direction: 'outbound',
+									subject: envelope.subject,
+									body: envelope.body,
+								}),
+								{},
+								{ 'Idempotency-Key': envelope.idempotencyKey },
+								(code) => {
+									statusCode = code;
+								},
+							);
+							// A pending response (HTTP 202, a real POST /messages ambiguous-outcome
+							// acceptance) has not reached a terminal state yet; caching it as confirmed
+							// could skip the email being sent for real. Only cache a terminal result,
+							// and only for 24 hours, matching Conduyt's own email key window.
+							if (!isPendingEmailOutcome(result, statusCode)) {
+								storeConfirmedSendOutcome.call(
+									this,
+									i,
+									result as IDataObject,
+									now,
+									EMAIL_CONFIRMED_SEND_TTL_MS,
+								);
+							}
+						}
+					}
 				} else if (resource === 'tag' && operation === 'create') {
 					result = await conduytApiRequest.call(this, 'POST', basePath, {
 						name: this.getNodeParameter('name', i) as string,
