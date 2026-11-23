@@ -8,7 +8,7 @@ import type {
 	INode,
 	JsonObject,
 } from 'n8n-workflow';
-import { NodeApiError, NodeOperationError } from 'n8n-workflow';
+import { NodeApiError, NodeOperationError, sleep } from 'n8n-workflow';
 import { createHash } from 'crypto';
 
 type ConduytContext = IExecuteFunctions | IHookFunctions | ILoadOptionsFunctions;
@@ -55,9 +55,14 @@ export async function conduytApiRequest(
 	qs: IDataObject = {},
 	headers: Record<string, string> = {},
 	// Handed the real HTTP status code of a successful (2xx) response, for a caller that
-	// needs to tell a 202 Accepted apart from a 200 OK (see `isPendingEmailOutcome`): the
-	// return value below stays just the unwrapped body for every other caller, unchanged.
-	onStatus?: (statusCode: number) => void,
+	// needs to tell a 202 Accepted apart from a 200 OK (see `isPendingEmailOutcome`), plus
+	// the raw (not unwrapped) body and the response headers, for a caller that needs a
+	// replay signal Conduyt puts outside `data` (see `isIdempotentReplay`): the return
+	// value below stays just the unwrapped body for every caller, unchanged.
+	onStatus?: (statusCode: number, rawBody: unknown, headers: IDataObject) => void,
+	// false only for Conduyt's public automation webhook receiver, which takes no API key:
+	// the key is then never sent.
+	authenticated = true,
 ): Promise<unknown> {
 	const credentials = await this.getCredentials('conduytApi');
 	const baseUrl = ((credentials.baseUrl as string) || 'https://conduyt.app/api/v1').replace(
@@ -86,12 +91,14 @@ export async function conduytApiRequest(
 	if (Object.keys(qs).length === 0) delete options.qs;
 
 	try {
-		const response = (await this.helpers.httpRequestWithAuthentication.call(
-			this,
-			'conduytApi',
-			options,
-		)) as { body?: unknown; statusCode?: number };
-		if (onStatus && typeof response?.statusCode === 'number') onStatus(response.statusCode);
+		const response = (
+			authenticated
+				? await this.helpers.httpRequestWithAuthentication.call(this, 'conduytApi', options)
+				: await this.helpers.httpRequest(options)
+		) as { body?: unknown; statusCode?: number; headers?: IDataObject };
+		if (onStatus && typeof response?.statusCode === 'number') {
+			onStatus(response.statusCode, response?.body, response?.headers ?? {});
+		}
 		return unwrap(response?.body);
 	} catch (error) {
 		const err = error as JsonObject & {
@@ -125,6 +132,88 @@ export async function conduytApiRequest(
 			responseBody;
 		throw apiError;
 	}
+}
+
+/** The HTTP status of a failed Conduyt request, when n8n's error carries one. */
+export function errorStatusCode(error: unknown): number | undefined {
+	const e = error as { httpCode?: unknown; response?: { status?: unknown } } | null;
+	const raw = e?.httpCode ?? e?.response?.status;
+	const code = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : NaN;
+	return Number.isInteger(code) ? code : undefined;
+}
+
+/**
+ * A keyed Conduyt write answered "a request with this key is still being processed" (409)
+ * or "nothing was stored, retry" (503: e.g. the matched contact was merged mid-create and
+ * the whole transaction rolled back). Repeating the SAME keyed request is safe: it either
+ * replays the stored answer or runs for the first time. A 409 `oes_number_taken` is a real
+ * conflict, never retried; a 422 (the key was used with a different body) and any other
+ * status are never retried either.
+ */
+export function isInFlightError(error: unknown): boolean {
+	const status = errorStatusCode(error);
+	if (status === 503) return true;
+	if (status !== 409) return false;
+	const body = (error as { conduytResponseBody?: JsonObject } | null)?.conduytResponseBody;
+	return !(body && body.code === 'oes_number_taken');
+}
+
+/** Step between in-flight retries; an object so tests can shorten it. */
+export const inFlightTiming = { stepMs: 3000 };
+
+/**
+ * Runs `attempt` and, while it fails with an in-flight answer (see `isInFlightError`),
+ * repeats it every `inFlightTiming.stepMs` until `budgetMs` of waiting is used up; then the
+ * last error is thrown. Call it ONLY for a request that carries an Idempotency-Key: without
+ * a key a repeat could create a second record. A budget of 0 means one attempt.
+ */
+export async function withInFlightWait<T>(attempt: () => Promise<T>, budgetMs: number): Promise<T> {
+	let waited = 0;
+	for (;;) {
+		try {
+			return await attempt();
+		} catch (error) {
+			if (!isInFlightError(error) || waited + inFlightTiming.stepMs > budgetMs) throw error;
+			await sleep(inFlightTiming.stepMs);
+			waited += inFlightTiming.stepMs;
+		}
+	}
+}
+
+/**
+ * Whether Conduyt answered a keyed write with the STORED result of an earlier request
+ * instead of running it again: the inbound webhook routes put `idempotentReplay: true` in
+ * the body, the core routes (POST /deals, POST /contacts) send `Idempotent-Replay: true`.
+ */
+export function isIdempotentReplay(rawBody: unknown, headers: IDataObject | undefined): boolean {
+	if (rawBody && typeof rawBody === 'object' && !Array.isArray(rawBody)) {
+		if ((rawBody as IDataObject).idempotentReplay === true) return true;
+	}
+	for (const [name, value] of Object.entries(headers ?? {})) {
+		if (name.toLowerCase() === 'idempotent-replay' && String(value).toLowerCase() === 'true') return true;
+	}
+	return false;
+}
+
+/**
+ * A caller-supplied Idempotency-Key for a create or webhook call: a string or safe integer
+ * (see `normalizeCallerKey`), no leading or trailing whitespace (the server trims), at most
+ * 255 characters (the routes' cap). Empty means "no key".
+ */
+export function writeIdempotencyKey(node: INode, raw: unknown, itemIndex: number): string | undefined {
+	const key = normalizeCallerKey(node, raw, itemIndex);
+	if (key === undefined) return undefined;
+	if (key !== key.trim() || key.trim() === '') {
+		throw new NodeOperationError(node, 'Idempotency Key must not have leading or trailing whitespace', {
+			itemIndex,
+		});
+	}
+	if (key.length > 255) {
+		throw new NodeOperationError(node, `Idempotency Key must be at most 255 characters, got ${key.length}`, {
+			itemIndex,
+		});
+	}
+	return key;
 }
 
 /**

@@ -19,15 +19,19 @@ import {
 	confirmedSendOutcome,
 	deliveryUnconfirmedMessage,
 	EMAIL_CONFIRMED_SEND_TTL_MS,
+	isIdempotentReplay,
 	isPendingEmailOutcome,
 	sendEnvelope,
 	splitTags,
 	storeConfirmedSendOutcome,
 	storeUnconfirmedSendOutcome,
 	unconfirmedSendOutcome,
+	withInFlightWait,
+	writeIdempotencyKey,
 } from './GenericFunctions';
 
 const RESOURCES = [
+	{ name: 'Automation', value: 'automation' },
 	{ name: 'Company', value: 'company' },
 	{ name: 'Contact', value: 'contact' },
 	{ name: 'Deal', value: 'deal' },
@@ -73,6 +77,29 @@ const getAllFields = (resource: string): INodeProperties[] => [
 	},
 ];
 
+/** Idempotency Key + in-flight wait, shared by the keyed write operations. */
+const keyedWriteFields = (resource: string, operation: string): INodeProperties[] => [
+	{
+		displayName: 'Idempotency Key',
+		name: 'idempotencyKey',
+		type: 'string',
+		default: '',
+		description:
+			'A key that names this one request, e.g. built from the upstream record or event ID (at most 255 characters, no leading or trailing whitespace). Conduyt runs a keyed request once: sending the same key with the same data again returns the stored result and the output says replayed = true; the same key with different data is rejected. Conduyt keeps the key for 24 hours.',
+		displayOptions: show(resource, operation),
+	},
+	{
+		displayName: 'Wait for In-Flight Copy (Seconds)',
+		name: 'inFlightWaitSeconds',
+		type: 'number',
+		typeOptions: { minValue: 0, maxValue: 600 },
+		default: 60,
+		description:
+			'Only with an Idempotency Key. When another copy of the same keyed request is still being processed (409), or Conduyt rolled the request back and asks for a retry (503), send the same keyed request again every 3 seconds for up to this long. It then returns the stored result (replayed = true). 0 = do not wait.',
+		displayOptions: show(resource, operation),
+	},
+];
+
 const idField = (resource: string, label: string, ops: string[]): INodeProperties => ({
 	displayName: `${label} ID`,
 	name: 'id',
@@ -81,6 +108,63 @@ const idField = (resource: string, label: string, ops: string[]): INodePropertie
 	required: true,
 	displayOptions: show(resource, ops),
 });
+
+/** A JSON-object parameter (string or object); empty / '{}' gives undefined. */
+function parseJsonObject(
+	ctx: IExecuteFunctions,
+	raw: unknown,
+	label: string,
+	itemIndex: number,
+): IDataObject | undefined {
+	if (raw === undefined || raw === null || raw === '') return undefined;
+	let value: unknown = raw;
+	if (typeof raw === 'string') {
+		try {
+			value = JSON.parse(raw);
+		} catch {
+			throw new NodeOperationError(ctx.getNode(), `${label} must be valid JSON`, { itemIndex });
+		}
+	}
+	if (!value || typeof value !== 'object' || Array.isArray(value)) {
+		throw new NodeOperationError(ctx.getNode(), `${label} must be a JSON object`, { itemIndex });
+	}
+	return Object.keys(value as IDataObject).length ? (value as IDataObject) : undefined;
+}
+
+/**
+ * One POST, keyed when `key` is set; with a key, an in-flight answer is waited out under the
+ * same key (see `withInFlightWait`). Returns the unwrapped body and whether Conduyt replayed
+ * a stored result.
+ */
+async function keyedPost(
+	ctx: IExecuteFunctions,
+	endpoint: string,
+	body: IDataObject,
+	key: string | undefined,
+	itemIndex: number,
+	authenticated: boolean,
+): Promise<{ result: unknown; replayed: boolean }> {
+	let replayed = false;
+	const waitSeconds = Number(ctx.getNodeParameter('inFlightWaitSeconds', itemIndex, 60));
+	const budgetMs = key && Number.isFinite(waitSeconds) && waitSeconds > 0 ? waitSeconds * 1000 : 0;
+	const result = await withInFlightWait(
+		() =>
+			conduytApiRequest.call(
+				ctx,
+				'POST',
+				endpoint,
+				body,
+				{},
+				key ? { 'Idempotency-Key': key } : {},
+				(_status, rawBody, headers) => {
+					replayed = isIdempotentReplay(rawBody, headers);
+				},
+				authenticated,
+			),
+		budgetMs,
+	);
+	return { result, replayed };
+}
 
 export class Conduyt implements INodeType {
 	description: INodeTypeDescription = {
@@ -105,6 +189,52 @@ export class Conduyt implements INodeType {
 				options: RESOURCES,
 				default: 'contact',
 			},
+
+			// ---------- Automation ----------
+			{
+				displayName: 'Operation',
+				name: 'operation',
+				type: 'options',
+				noDataExpression: true,
+				displayOptions: show('automation'),
+				options: [
+					{
+						name: 'Trigger Webhook',
+						value: 'triggerWebhook',
+						description: 'Start a Conduyt automation that has a webhook trigger',
+						action: 'Trigger an automation webhook',
+					},
+				],
+				default: 'triggerWebhook',
+			},
+			{
+				displayName: 'Webhook ID',
+				name: 'webhookId',
+				type: 'string',
+				default: '',
+				required: true,
+				description:
+					"The ID at the end of the automation's webhook URL (…/api/v1/webhooks/automation/&lt;ID&gt;). The automation runs before Conduyt answers.",
+				displayOptions: show('automation', 'triggerWebhook'),
+			},
+			{
+				displayName: 'Payload (JSON)',
+				name: 'payload',
+				type: 'json',
+				default: '{}',
+				description: "The JSON object the automation's trigger receives",
+				displayOptions: show('automation', 'triggerWebhook'),
+			},
+			{
+				displayName: 'Fail If Nothing Ran',
+				name: 'failIfNothingRan',
+				type: 'boolean',
+				default: true,
+				description:
+					'Whether to fail the item when Conduyt ran no automation for this webhook (none matches it, or it is switched off). A repeat Conduyt recognised (deduplicated) is never a failure.',
+				displayOptions: show('automation', 'triggerWebhook'),
+			},
+			...keyedWriteFields('automation', 'triggerWebhook'),
 
 			// ---------- Contact ----------
 			{
@@ -257,6 +387,13 @@ export class Conduyt implements INodeType {
 				displayOptions: show('deal'),
 				options: [
 					{ name: 'Create', value: 'create', description: 'Create a deal', action: 'Create a deal' },
+					{
+						name: 'Create for Contact',
+						value: 'createForContact',
+						description:
+							'Find the contact by phone or email (or create it) and create a deal on it, in one step',
+						action: 'Create a deal for a contact found or created by phone or email',
+					},
 					{ name: 'Get', value: 'get', description: 'Get a deal', action: 'Get a deal' },
 					{ name: 'Get Many', value: 'getAll', description: 'Get many deals', action: 'Get many deals' },
 					{ name: 'Update', value: 'update', description: 'Update a deal', action: 'Update a deal' },
@@ -270,7 +407,48 @@ export class Conduyt implements INodeType {
 				type: 'string',
 				default: '',
 				required: true,
-				displayOptions: show('deal', 'create'),
+				displayOptions: show('deal', ['create', 'createForContact']),
+			},
+			{
+				displayName: 'Contact Phone',
+				name: 'contactPhone',
+				type: 'string',
+				default: '',
+				description:
+					"Used to find the contact (with Contact Email); normalized to E.164 with the account's default country. A phone or an email is required.",
+				displayOptions: show('deal', 'createForContact'),
+			},
+			{
+				displayName: 'Contact Email',
+				name: 'contactEmail',
+				type: 'string',
+				placeholder: 'name@email.com',
+				default: '',
+				displayOptions: show('deal', 'createForContact'),
+			},
+			{
+				displayName: 'Contact First Name',
+				name: 'contactFirstName',
+				type: 'string',
+				default: '',
+				description:
+					"Confirms a match (Conduyt's duplicate rules: the name never finds a contact, it confirms one) and names a new contact",
+				displayOptions: show('deal', 'createForContact'),
+			},
+			{
+				displayName: 'Contact Last Name',
+				name: 'contactLastName',
+				type: 'string',
+				default: '',
+				displayOptions: show('deal', 'createForContact'),
+			},
+			{
+				displayName: 'Contact Company',
+				name: 'contactCompany',
+				type: 'string',
+				default: '',
+				description: 'Linked as the contact\'s company (also on an existing contact)',
+				displayOptions: show('deal', 'createForContact'),
 			},
 			{
 				displayName: 'Pipeline Name or ID',
@@ -280,7 +458,7 @@ export class Conduyt implements INodeType {
 				default: '',
 				description:
 					'Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>',
-				displayOptions: show('deal', 'create'),
+				displayOptions: show('deal', ['create', 'createForContact']),
 			},
 			{
 				displayName: 'Stage Name or ID',
@@ -290,8 +468,35 @@ export class Conduyt implements INodeType {
 				default: '',
 				description:
 					'Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>',
-				displayOptions: show('deal', 'create'),
+				displayOptions: show('deal', ['create', 'createForContact']),
 			},
+			{
+				displayName: 'Additional Fields',
+				name: 'forContactFields',
+				type: 'collection',
+				placeholder: 'Add Field',
+				default: {},
+				displayOptions: show('deal', 'createForContact'),
+				options: [
+					{
+						displayName: 'Custom Fields (JSON)',
+						name: 'customFields',
+						type: 'json',
+						default: '{}',
+						description: 'Object of deal custom field key to value',
+					},
+					{ displayName: 'Expected Close Date', name: 'expectedCloseDate', type: 'dateTime', default: '' },
+					{
+						displayName: 'Source',
+						name: 'source',
+						type: 'string',
+						default: '',
+						description: 'The lead source on the deal, and on the contact when one is created',
+					},
+					{ displayName: 'Value', name: 'value', type: 'number', default: 0 },
+				],
+			},
+			...keyedWriteFields('deal', 'createForContact'),
 			{
 				displayName: 'Additional Fields',
 				name: 'additionalFields',
@@ -303,8 +508,16 @@ export class Conduyt implements INodeType {
 					{ displayName: 'Assigned To (User ID)', name: 'assignedTo', type: 'string', default: '' },
 					{ displayName: 'Company ID', name: 'companyId', type: 'string', default: '' },
 					{ displayName: 'Contact ID', name: 'contactId', type: 'string', default: '' },
+					{
+						displayName: 'Custom Fields (JSON)',
+						name: 'customFields',
+						type: 'json',
+						default: '{}',
+						description: 'Object of deal custom field key to value',
+					},
 					{ displayName: 'Expected Close Date', name: 'expectedCloseDate', type: 'dateTime', default: '' },
 					{ displayName: 'Pipeline ID', name: 'pipelineId', type: 'string', default: '' },
+					{ displayName: 'Source', name: 'source', type: 'string', default: '' },
 					{ displayName: 'Stage ID', name: 'stageId', type: 'string', default: '' },
 					{
 						displayName: 'Status',
@@ -719,6 +932,66 @@ export class Conduyt implements INodeType {
 							}
 						}
 					}
+				} else if (resource === 'deal' && operation === 'createForContact') {
+					// POST /webhooks/inbound/deals: Conduyt finds the contact by phone / email under
+					// its duplicate rules (or creates it) and creates the deal, in ONE transaction
+					// together with the Idempotency-Key claim, so a keyed repeat can never make a
+					// second contact or deal.
+					const key = writeIdempotencyKey(this.getNode(), this.getNodeParameter('idempotencyKey', i, ''), i);
+					const contact = clean({
+						phone: String(this.getNodeParameter('contactPhone', i, '') ?? '').trim(),
+						email: String(this.getNodeParameter('contactEmail', i, '') ?? '').trim(),
+						firstName: String(this.getNodeParameter('contactFirstName', i, '') ?? '').trim(),
+						lastName: String(this.getNodeParameter('contactLastName', i, '') ?? '').trim(),
+						company: String(this.getNodeParameter('contactCompany', i, '') ?? '').trim(),
+					});
+					if (!contact.phone && !contact.email) {
+						throw new NodeOperationError(this.getNode(), 'A Contact Phone or Contact Email is required', {
+							itemIndex: i,
+						});
+					}
+					const extra = this.getNodeParameter('forContactFields', i, {}) as IDataObject;
+					const body = clean({
+						title: this.getNodeParameter('title', i) as string,
+						pipelineId: this.getNodeParameter('pipelineId', i, '') as string,
+						stageId: this.getNodeParameter('stageId', i, '') as string,
+						source: extra.source,
+						value: extra.value,
+						expectedCloseDate: extra.expectedCloseDate,
+						customFields: parseJsonObject(this, extra.customFields, 'Custom Fields', i),
+						contact,
+					});
+					const keyed = await keyedPost(this, '/webhooks/inbound/deals', body, key, i, true);
+					result = { ...(keyed.result as IDataObject), replayed: keyed.replayed };
+				} else if (resource === 'automation' && operation === 'triggerWebhook') {
+					// POST /webhooks/automation/{id}: public, takes no API key, runs the automation
+					// before it answers { ok, triggered } (or { ok, triggered: 0, deduplicated: true }
+					// for a repeat it recognised by the key, else by the body's hash).
+					const webhookId = String(this.getNodeParameter('webhookId', i) ?? '').trim();
+					if (!webhookId) {
+						throw new NodeOperationError(this.getNode(), 'Webhook ID is required', { itemIndex: i });
+					}
+					const key = writeIdempotencyKey(this.getNode(), this.getNodeParameter('idempotencyKey', i, ''), i);
+					const payload = parseJsonObject(this, this.getNodeParameter('payload', i, '{}'), 'Payload', i) ?? {};
+					const keyed = await keyedPost(
+						this,
+						`/webhooks/automation/${encodeURIComponent(webhookId)}`,
+						payload,
+						key,
+						i,
+						false,
+					);
+					const answer = (keyed.result ?? {}) as IDataObject;
+					const triggered = Number(answer.triggered ?? 0);
+					const deduplicated = answer.deduplicated === true;
+					if (this.getNodeParameter('failIfNothingRan', i, true) && !deduplicated && !(triggered > 0)) {
+						throw new NodeOperationError(
+							this.getNode(),
+							`No automation ran for webhook ${webhookId}: none matches it, or it is switched off`,
+							{ itemIndex: i },
+						);
+					}
+					result = { ok: answer.ok === true, triggered, deduplicated, replayed: deduplicated };
 				} else if (resource === 'tag' && operation === 'create') {
 					result = await conduytApiRequest.call(this, 'POST', basePath, {
 						name: this.getNodeParameter('name', i) as string,
