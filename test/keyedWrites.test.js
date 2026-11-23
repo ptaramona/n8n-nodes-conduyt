@@ -116,6 +116,70 @@ test('Create for Contact: a copy in flight (409) is waited out under the SAME ke
 	assert.equal(out.json.replayed, true);
 });
 
+// The exact production sequences (conduyt-batch59 app/api/v1/webhooks/inbound/deals/route.ts): the CREATOR whose routing failed
+// gets 409 "Deal recorded; routing retry pending" (1026-1029), then "still being processed" inside the 30 s window (860-863), then
+// the stored deal as a replay after the takeover (847-857); a COPY only ever sees "still being processed" / "Idempotent recovery is
+// retrying" (816-818) before its replay.
+const ROUTING_PENDING = () => {
+	throw httpError(409, { error: 'Deal recorded; routing retry pending — replay with the same Idempotency-Key' });
+};
+const IN_PROGRESS = () => {
+	throw httpError(409, { error: 'A request with this Idempotency-Key is still being processed' });
+};
+const RECOVERY_RETRYING = () => {
+	throw httpError(409, { error: 'Idempotent recovery is retrying — replay again shortly' });
+};
+const STORED = { statusCode: 200, body: { data: DEAL, idempotentReplay: true } };
+
+test('Create for Contact: a fresh 201 is createdHere = true', async () => {
+	const [[out]] = await run(ctx('deal', 'createForContact', forContact(), [{ statusCode: 201, body: { data: DEAL } }]));
+	assert.equal(out.json.replayed, false);
+	assert.equal(out.json.createdHere, true);
+});
+
+test('Create for Contact: THIS request created the deal (409 routing pending -> 409 in progress -> stored 200): replayed = true AND createdHere = true', async () => {
+	const c = ctx('deal', 'createForContact', forContact(), [ROUTING_PENDING, IN_PROGRESS, STORED]);
+	const [[out]] = await run(c);
+	assert.equal(c.calls.length, 3);
+	assert.equal(out.json.id, DEAL.id);
+	assert.equal(out.json.replayed, true);
+	assert.equal(out.json.createdHere, true);
+});
+
+test('Create for Contact: the creator-only answer carried as a future machine code counts too', async () => {
+	const c = ctx('deal', 'createForContact', forContact(), [
+		() => {
+			throw httpError(409, { error: 'whatever wording', code: 'deal_recorded_routing_pending' });
+		},
+		STORED,
+	]);
+	const [[out]] = await run(c);
+	assert.equal(out.json.createdHere, true);
+});
+
+test('Create for Contact: a COPY (in progress / recovery retrying -> stored 200) is createdHere = false', async () => {
+	for (const seq of [[STORED], [IN_PROGRESS, STORED], [IN_PROGRESS, RECOVERY_RETRYING, STORED]]) {
+		const [[out]] = await run(ctx('deal', 'createForContact', forContact(), seq));
+		assert.equal(out.json.replayed, true);
+		assert.equal(out.json.createdHere, false, `sequence of ${seq.length}`);
+	}
+});
+
+test('Create for Contact: the creator whose wait runs out gets an error that says the deal WAS created', async () => {
+	const c = ctx('deal', 'createForContact', forContact({ inFlightWaitSeconds: 0 }), [ROUTING_PENDING]);
+	await assert.rejects(() => run(c), /created the record for this request/);
+	const plain = ctx('deal', 'createForContact', forContact({ inFlightWaitSeconds: 0 }), [IN_PROGRESS]);
+	await assert.rejects(() => run(plain), (e) => !/created the record/.test(e.message));
+});
+
+test('isCreatorRecordedAnswer: only a 409 with the creator-only wording or code', () => {
+	assert.equal(G.isCreatorRecordedAnswer(httpError(409, { error: 'Deal recorded; routing retry pending — replay with the same Idempotency-Key' })), true);
+	assert.equal(G.isCreatorRecordedAnswer(httpError(409, { error: 'x', code: 'deal_recorded_routing_pending' })), true);
+	assert.equal(G.isCreatorRecordedAnswer(httpError(409, { error: 'A request with this Idempotency-Key is still being processed' })), false);
+	assert.equal(G.isCreatorRecordedAnswer(httpError(500, { error: 'Deal recorded; routing retry pending' })), false);
+	assert.equal(G.isCreatorRecordedAnswer(new Error('Deal recorded;')), false);
+});
+
 test('Create for Contact: without a key a 409 is NOT repeated (a repeat could create a second deal)', async () => {
 	const c = ctx('deal', 'createForContact', forContact({ idempotencyKey: '' }), [
 		() => {

@@ -154,8 +154,34 @@ export function isInFlightError(error: unknown): boolean {
 	const status = errorStatusCode(error);
 	if (status === 503) return true;
 	if (status !== 409) return false;
-	const body = (error as { conduytResponseBody?: JsonObject } | null)?.conduytResponseBody;
-	return !(body && body.code === 'oes_number_taken');
+	return errorResponseBody(error).code !== 'oes_number_taken';
+}
+
+/** The parsed body of a failed request: the one conduytApiRequest attached, else where n8n / Axios put it. */
+function errorResponseBody(error: unknown): JsonObject {
+	const e = error as {
+		conduytResponseBody?: JsonObject;
+		context?: { data?: unknown };
+		response?: { body?: unknown; data?: unknown };
+	} | null;
+	return firstResponseBody(e?.conduytResponseBody, e?.context?.data, e?.response?.data, e?.response?.body);
+}
+
+/**
+ * The answer Conduyt's inbound deals route gives ONLY to the request that committed the deal
+ * when its lead routing then failed: 409 "Deal recorded; routing retry pending — replay with
+ * the same Idempotency-Key" (app/api/v1/webhooks/inbound/deals/route.ts, the creator's own
+ * finalization path). Every other 409 of that route goes to a copy, never to the creator. A
+ * later repeat under the same key then gets the STORED deal as a replay, so without this
+ * signal the creating request would look like a resend. Production sends no machine code
+ * for it today; `code: 'deal_recorded_routing_pending'` is accepted for when it does, and the
+ * message prefix is the signal until then.
+ */
+export function isCreatorRecordedAnswer(error: unknown): boolean {
+	if (errorStatusCode(error) !== 409) return false;
+	const body = errorResponseBody(error);
+	if (body.code === 'deal_recorded_routing_pending') return true;
+	return typeof body.error === 'string' && body.error.startsWith('Deal recorded;');
 }
 
 /** Step between in-flight retries; an object so tests can shorten it. */

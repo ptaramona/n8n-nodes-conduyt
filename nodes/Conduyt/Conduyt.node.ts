@@ -19,6 +19,7 @@ import {
 	confirmedSendOutcome,
 	deliveryUnconfirmedMessage,
 	EMAIL_CONFIRMED_SEND_TTL_MS,
+	isCreatorRecordedAnswer,
 	isIdempotentReplay,
 	isPendingEmailOutcome,
 	sendEnvelope,
@@ -85,7 +86,7 @@ const keyedWriteFields = (resource: string, operation: string): INodeProperties[
 		type: 'string',
 		default: '',
 		description:
-			'A key that names this one request, e.g. built from the upstream record or event ID (at most 255 characters, no leading or trailing whitespace). Conduyt runs a keyed request once: sending the same key with the same data again returns the stored result and the output says replayed = true; the same key with different data is rejected. Conduyt keeps the key for 24 hours.',
+			'A key that names this one request, e.g. built from the upstream record or event ID (at most 255 characters, no leading or trailing whitespace). Conduyt runs a keyed request once: sending the same key with the same data again returns the stored result and the output says replayed = true; the same key with different data is rejected. Conduyt keeps the key for 24 hours. Deal > Create for Contact also outputs createdHere: true when THIS node run created the deal (a fresh create, or a stored answer read back after Conduyt recorded the deal for this request but asked it to repeat), false for a repeat of an earlier request. Continue on createdHere, not on replayed.',
 		displayOptions: show(resource, operation),
 	},
 	{
@@ -133,8 +134,10 @@ function parseJsonObject(
 
 /**
  * One POST, keyed when `key` is set; with a key, an in-flight answer is waited out under the
- * same key (see `withInFlightWait`). Returns the unwrapped body and whether Conduyt replayed
- * a stored result.
+ * same key (see `withInFlightWait`). Returns the unwrapped body, whether Conduyt replayed a
+ * stored result, and whether THIS call created the record: a fresh (non-replayed) answer, or
+ * a replay that follows the creator-only "deal recorded" answer an earlier attempt of this
+ * same call received (see `isCreatorRecordedAnswer`).
  */
 async function keyedPost(
 	ctx: IExecuteFunctions,
@@ -143,27 +146,47 @@ async function keyedPost(
 	key: string | undefined,
 	itemIndex: number,
 	authenticated: boolean,
-): Promise<{ result: unknown; replayed: boolean }> {
+): Promise<{ result: unknown; replayed: boolean; createdHere: boolean }> {
 	let replayed = false;
+	let recordedHere = false;
 	const waitSeconds = Number(ctx.getNodeParameter('inFlightWaitSeconds', itemIndex, 60));
 	const budgetMs = key && Number.isFinite(waitSeconds) && waitSeconds > 0 ? waitSeconds * 1000 : 0;
-	const result = await withInFlightWait(
-		() =>
-			conduytApiRequest.call(
-				ctx,
-				'POST',
-				endpoint,
-				body,
-				{},
-				key ? { 'Idempotency-Key': key } : {},
-				(_status, rawBody, headers) => {
-					replayed = isIdempotentReplay(rawBody, headers);
-				},
-				authenticated,
-			),
-		budgetMs,
-	);
-	return { result, replayed };
+	let result: unknown;
+	try {
+		result = await withInFlightWait(
+			() =>
+				conduytApiRequest
+					.call(
+						ctx,
+						'POST',
+						endpoint,
+						body,
+						{},
+						key ? { 'Idempotency-Key': key } : {},
+						(_status, rawBody, headers) => {
+							replayed = isIdempotentReplay(rawBody, headers);
+						},
+						authenticated,
+					)
+					.catch((error: unknown) => {
+						if (isCreatorRecordedAnswer(error)) recordedHere = true;
+						throw error;
+					}),
+			budgetMs,
+		);
+	} catch (error) {
+		if (recordedHere) {
+			// The record exists and was made by this call, but Conduyt never handed back its final
+			// answer within the wait: say so, so nobody mistakes it for "nothing was created".
+			throw new NodeOperationError(
+				ctx.getNode(),
+				'Conduyt created the record for this request, but its lead routing was still pending when the wait ended; nothing after this step ran for it. Send the same keyed request again later to read the stored record.',
+				{ itemIndex },
+			);
+		}
+		throw error;
+	}
+	return { result, replayed, createdHere: !replayed || recordedHere };
 }
 
 export class Conduyt implements INodeType {
@@ -962,7 +985,7 @@ export class Conduyt implements INodeType {
 						contact,
 					});
 					const keyed = await keyedPost(this, '/webhooks/inbound/deals', body, key, i, true);
-					result = { ...(keyed.result as IDataObject), replayed: keyed.replayed };
+					result = { ...(keyed.result as IDataObject), replayed: keyed.replayed, createdHere: keyed.createdHere };
 				} else if (resource === 'automation' && operation === 'triggerWebhook') {
 					// POST /webhooks/automation/{id}: public, takes no API key, runs the automation
 					// before it answers { ok, triggered } (or { ok, triggered: 0, deduplicated: true }
